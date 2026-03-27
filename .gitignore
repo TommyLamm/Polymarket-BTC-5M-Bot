@@ -1,0 +1,15 @@
+# Environments
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs and Data
+trades_log.csv
+*.log
+
+# Git/OS
+.DS_Store
+Thumbs.db

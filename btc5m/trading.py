@@ -1,0 +1,415 @@
+"""
+btc5m.trading — 交易執行與倉位管理（買入、平倉、持倉監控、主循環）
+"""
+
+import time
+import datetime
+
+from py_clob_client.clob_types import OrderArgs
+from py_clob_client.order_builder.constants import BUY, SELL
+
+import btc5m.config as cfg
+from btc5m.config import (
+    client, FUNDER_ADDRESS,
+    MAX_USD, SLIPPAGE, ORDER_TIMEOUT, MIN_SPREAD, MAX_SPREAD,
+    START_CAPITAL, DAILY_MAX_LOSS, DAILY_TAKE_PROFIT,
+    POS_MAX_HOLD_SEC, MAX_POSITIONS, COOLDOWN_SEC,
+    CONSECUTIVE_LOSS_LIMIT, PAUSE_AFTER_LOSS_SEC,
+    open_positions, _recently_closed,
+    _positions_lock, _manage_lock, _analyze_lock,
+    _pause_until_lock, _consecutive_losses_lock,
+)
+from btc5m.utils import (
+    send, _api_call_with_timeout, log_trade,
+    get_daily_realized_pnl, _parse_orderbook,
+    _get_order_id, _clean_recently_closed,
+)
+from btc5m.market import fetch_active_btc5m_markets, _resolve_token_id
+from btc5m.signals import get_btc_signals
+
+
+# ======================================================
+# 🔄  訂單成交輪詢
+# ======================================================
+
+def _poll_order_matched(oid: str, fallback_price: float) -> tuple:
+    """
+    輪詢訂單狀態直到成交或超時。
+    回傳 (成交成功: bool, 成交估算價: float)
+    """
+    t0 = time.time()
+    while time.time() - t0 < ORDER_TIMEOUT:
+        try:
+            st = _api_call_with_timeout(client.get_order, oid)
+            status = (getattr(st, "status", "") if hasattr(st, "status") else st.get("status", ""))
+            print(f"🔍 訂單狀態 debug: {status}")
+            if status in ("ORDER_STATUS_MATCHED", "MATCHED"):
+                return True, fallback_price
+            if status in ("ORDER_STATUS_PARTIALLY_FILLED", "PARTIALLY_MATCHED"):
+                return True, fallback_price
+        except Exception:
+            pass
+        time.sleep(2)
+    return False, fallback_price
+
+
+# ======================================================
+# 📤  平倉邏輯
+# ======================================================
+
+def _close_position(token_id: str):
+    """以市價賣出平倉，更新損益統計與熔斷狀態。"""
+    with _positions_lock:
+        if token_id not in open_positions:
+            return
+        pos = open_positions[token_id].copy()
+        size, entry_price = pos["size"], pos["entry_price"]
+
+    try:
+        book = _api_call_with_timeout(client.get_order_book, token_id)
+        best_bid, best_ask = _parse_orderbook(book)
+        if best_bid is None or best_ask is None:
+            return
+
+        # 市價賣出：直接吃 ask，增加 0.001 讓它一定成交
+        limit_price = round(best_ask + 0.001, 3)
+        # 確保賣出量不超過實際持倉（避免 not enough balance）
+        safe_size    = round(min(size, size * 0.99), 2)
+        order_args   = OrderArgs(price=limit_price, size=safe_size,
+                                 side=SELL, token_id=token_id)
+        signed_order = _api_call_with_timeout(client.create_order, order_args)
+        resp         = _api_call_with_timeout(client.post_order, signed_order)
+
+        success = (getattr(resp, "success", False)
+                   or (isinstance(resp, dict) and resp.get("success")))
+        if not success:
+            err = (getattr(resp, "errorMsg", "")
+                   or (resp.get("errorMsg", "") if isinstance(resp, dict) else ""))
+            send(f"⚠️ 平倉下單失敗: {err}")
+            return
+
+        oid        = _get_order_id(resp)
+        exit_price = limit_price  # 估算值
+
+        if oid:
+            filled, exit_price = _poll_order_matched(oid, limit_price)
+            if not filled:
+                send(f"⚠️ 平倉訂單 {oid[:12]}… 超時未成交")
+        else:
+            send("⚠️ 無法取得平倉訂單 ID，以限價估算退出價格")
+
+        slippage_pct = round((exit_price - best_bid) / best_bid, 6) if best_bid else 0
+        realized_pnl = (exit_price - entry_price) * size
+
+        log_trade({
+            "date":         datetime.date.today().isoformat(),
+            "timestamp":    datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "token_id":     token_id,
+            "side":         "sell",
+            "entry_price":  round(entry_price, 4),
+            "exit_price":   round(exit_price, 4),
+            "size":         round(size, 2),
+            "slippage_pct": slippage_pct,
+            "realized_pnl": round(realized_pnl, 4),
+            "status":       "closed",
+        })
+        send(f"📤 平倉 {token_id[:8]}… "
+             f"進@{entry_price:.3f} 出@{exit_price:.3f} "
+             f"PnL: {realized_pnl:+.4f} USDC")
+
+        with _positions_lock:
+            open_positions.pop(token_id, None)
+
+        # 熔斷邏輯
+        with _consecutive_losses_lock:
+            if realized_pnl < 0:
+                cfg._consecutive_losses += 1
+                if cfg._consecutive_losses >= CONSECUTIVE_LOSS_LIMIT:
+                    with _pause_until_lock:
+                        cfg._pause_until = time.time() + PAUSE_AFTER_LOSS_SEC
+                    send(f"🛡️ 熔斷：連虧 {cfg._consecutive_losses} 次，"
+                         f"暫停 {PAUSE_AFTER_LOSS_SEC // 60} 分鐘")
+                    cfg._consecutive_losses = 0
+            else:
+                cfg._consecutive_losses = 0
+
+    except Exception as e:
+        print(f"❌ 平倉異常: {e}")
+
+
+# ======================================================
+# 📊  持倉監控（止盈 / 止損 / 超時）
+# ======================================================
+
+def manage_positions():
+    """
+    檢查所有持倉：達到止盈、止損或超時則觸發平倉。
+    使用 _manage_lock 防止並發重入。
+    """
+    if not _manage_lock.acquire(blocking=False):
+        return
+    try:
+        with _positions_lock:
+            tokens = list(open_positions.items())
+
+        if not tokens:
+            return
+
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        for token_id, pos in tokens:
+            entry_price  = pos["entry_price"]
+            hold_seconds = (now_dt - pos["opened_at"]).total_seconds()
+
+            try:
+                book = _api_call_with_timeout(client.get_order_book, token_id)
+                best_bid, _ = _parse_orderbook(book)
+            except Exception:
+                continue
+
+            if best_bid is None:
+                continue
+
+            tp_target = entry_price + pos["entry_spread"] * pos["tp_pct"]
+            sl_target = entry_price * (1 - pos["sl_pct"])
+
+            unrealized_pct = (best_bid - entry_price) / entry_price
+            if unrealized_pct > 0.05:
+                max_hold = min(POS_MAX_HOLD_SEC, max(pos["time_left"] - 60, 20))
+            elif unrealized_pct < -0.03:
+                max_hold = min(POS_MAX_HOLD_SEC, max(pos["time_left"] - 15, 45))
+            else:
+                max_hold = min(POS_MAX_HOLD_SEC, max(pos["time_left"] - 30, 30))
+
+            reason = None
+            if best_bid >= tp_target:
+                reason = "🎯 達到動態止盈"
+            elif best_bid <= sl_target:
+                reason = "🚨 觸發動態止損"
+            elif hold_seconds >= max_hold:
+                reason = "⏰ 結算規避/超時"
+
+            if reason:
+                send(f"{reason} | {pos['question'][:25]} | 現價 {best_bid:.3f}")
+                _close_position(token_id)
+                _recently_closed[token_id] = time.time()
+                _clean_recently_closed()
+    finally:
+        _manage_lock.release()
+
+
+# ======================================================
+# ⚡  主交易循環
+# ======================================================
+
+def analyze_and_trade():
+    """
+    主交易循環（每 20 秒觸發）：
+      1. 管理現有持倉
+      2. 檢查熔斷 / 每日風控
+      3. 取得量化信號
+      4. 查詢當前 BTC 5M 活躍市場
+      5. 篩選合適標的並下單建倉
+    """
+    if not _analyze_lock.acquire(blocking=False):
+        return
+    try:
+        manage_positions()
+
+        # 熔斷冷卻檢查
+        with _pause_until_lock:
+            pause = cfg._pause_until
+        if time.time() < pause:
+            print(f"🛡️ 熔斷冷卻中，剩餘 {int(pause - time.time())}s")
+            return
+
+        # 每日風控
+        pnl_today = get_daily_realized_pnl()
+        if pnl_today < -START_CAPITAL * DAILY_MAX_LOSS:
+            send("🚫 已觸及單日最大虧損，今日停止交易")
+            return
+        if pnl_today > START_CAPITAL * DAILY_TAKE_PROFIT:
+            send("🏆 已達單日止盈目標，今日停止交易")
+            return
+
+        # 持倉上限
+        with _positions_lock:
+            if len(open_positions) >= MAX_POSITIONS:
+                return
+
+        # 量化信號
+        btc_info   = get_btc_signals()
+        signal_dir = btc_info["signal"]
+        if signal_dir == 0:
+            return  # 診斷輸出已在 get_btc_signals() 內完成
+
+        dir_str = "看漲 (買UP/YES)" if signal_dir == 1 else "看跌 (買DOWN/NO)"
+        send(f"⚡ 捕捉到大盤 {dir_str} 信號！(ADX:{btc_info['adx']:.1f})")
+
+        # 透過 Series API 動態取得當前窗口子市場
+        markets = fetch_active_btc5m_markets()
+        if not markets:
+            print("⚠️ 找不到 BTC 5M 子市場")
+            return
+
+        print(f"\n🔎 開始掃描 {len(markets)} 個子市場...")
+
+        for gm in markets:
+            q = gm.get("question", "N/A")
+            print(f"\n  📌 市場: {q[:50]}")
+
+            # 跳過暫停接單的市場
+            if not gm.get("acceptingOrders", False):
+                print(f"     ❌ 跳過：acceptingOrders=False")
+                continue
+
+            # 跳過 negRisk 市場
+            if gm.get("negRisk", False):
+                print(f"     ❌ 跳過：negRisk 市場")
+                continue
+
+            # 迴避剩餘時間 < 60 秒的市場
+            time_left    = 300
+            end_date_str = gm.get("endDate") or gm.get("endDateIso", "")
+            if end_date_str:
+                try:
+                    end_dt    = datetime.datetime.fromisoformat(
+                                    end_date_str.replace("Z", "+00:00"))
+                    time_left = (end_dt - datetime.datetime.now(
+                                    datetime.timezone.utc)).total_seconds()
+                    print(f"     ⏱  剩餘時間: {int(time_left)}s")
+                    if time_left < 60:
+                        print(f"     ❌ 跳過：剩餘時間 < 60s")
+                        continue
+                except ValueError:
+                    pass
+
+            # 解析目標代幣 ID
+            target_token_id, outcome_label = _resolve_token_id(gm, signal_dir)
+            if not target_token_id:
+                print(f"     ❌ 跳過：無法解析代幣 ID (outcomes={gm.get('outcomes')})")
+                continue
+            print(f"     🎯 目標 outcome: {outcome_label}  token: {target_token_id[:12]}…")
+
+            # 持倉重複與冷卻期檢查
+            with _positions_lock:
+                if target_token_id in open_positions:
+                    print(f"     ❌ 跳過：此代幣已持倉")
+                    continue
+            if (target_token_id in _recently_closed and
+                    time.time() - _recently_closed[target_token_id] < COOLDOWN_SEC):
+                print(f"     ❌ 跳過：冷卻中")
+                continue
+
+            try:
+                book = _api_call_with_timeout(client.get_order_book, target_token_id)
+                best_bid, best_ask = _parse_orderbook(book)
+                print(f"     📖 訂單簿: bid={best_bid}  ask={best_ask}")
+
+                if best_bid is None or best_ask is None:
+                    print(f"     ❌ 跳過：訂單簿無流動性")
+                    continue
+
+                # ATM 過濾
+                if not (0.30 <= best_ask <= 0.70):
+                    print(f"     ❌ 跳過：ask={best_ask:.3f} 不在 ATM 範圍 [0.30, 0.70]")
+                    continue
+
+                spread = best_ask - best_bid
+                print(f"     📐 價差: {spread:.4f}  (需在 [{MIN_SPREAD}, {MAX_SPREAD}])")
+                if spread < MIN_SPREAD or spread > MAX_SPREAD:
+                    print(f"     ❌ 跳過：價差不符條件")
+                    continue
+
+                # 確保下單量 ≥ orderMinSize
+                min_size = float(gm.get("orderMinSize") or 1)
+                conf_multiplier = 1.5 if btc_info.get("high_conf") else 1.0
+                size = max(round(MAX_USD * conf_multiplier / best_ask, 2), min_size)
+
+                # ATR/ADX 自適應 TP/SL
+                tp_pct = 0.30
+                sl_pct = 0.15
+                if btc_info["adx"] > 25:
+                    tp_pct = 0.45
+                if btc_info["close"] > 0 and btc_info["atr"] / btc_info["close"] > 0.0015:
+                    sl_pct = 0.25
+                    tp_pct = max(tp_pct, 0.40)
+
+                rr_ratio    = tp_pct / sl_pct
+                limit_price = round(
+                    min(best_bid + spread * 0.5 * (1 + SLIPPAGE), best_ask), 3)
+
+                send(f"💡 鎖定標的: {q[:35]}\n"
+                     f"方向: {dir_str} ({outcome_label}) | Ask: {best_ask:.3f}\n"
+                     f"R:R 比: {rr_ratio:.1f} "
+                     f"(TP:{tp_pct*100:.0f}% / SL:{sl_pct*100:.0f}%)\n"
+                     f"下單量: {size:.2f} 份 @ {limit_price:.3f}")
+
+                order_args   = OrderArgs(price=limit_price, size=size,
+                                         side=BUY, token_id=target_token_id)
+                signed_order = _api_call_with_timeout(client.create_order, order_args)
+                resp         = _api_call_with_timeout(client.post_order, signed_order)
+
+                success = (getattr(resp, "success", False)
+                           or (isinstance(resp, dict) and resp.get("success")))
+                if not success:
+                    err = (getattr(resp, "errorMsg", "")
+                           or (resp.get("errorMsg", "") if isinstance(resp, dict) else ""))
+                    send(f"⚠️ 下單失敗: {err}")
+                    continue
+
+                oid = _get_order_id(resp)
+                if not oid:
+                    send("⚠️ 無法取得訂單 ID，跳過建倉")
+                    continue
+
+                send(f"📨 訂單已送出 ID: {oid[:16]}…，等待成交…")
+
+                # 輪詢等待成交；超時則取消訂單
+                filled, fill_price = _poll_order_matched(oid, limit_price)
+                if not filled:
+                    try:
+                        _api_call_with_timeout(client.cancel_order, oid)
+                        send(f"⏰ 訂單 {oid[:12]}… 超時未成交，已取消")
+                    except Exception:
+                        pass
+                    continue
+
+                # === 建倉成功：寫入倉位 ===
+                with _positions_lock:
+                    # 查詢真實成交量
+                    trades = client.get_trades()
+                    real_size = 0.0
+                    for t in trades:
+                        maker = str(t.get("maker") or t.get("maker_address") or "")
+                        if maker.lower() == FUNDER_ADDRESS.lower():
+                            if (str(t.get("token_id")) == str(target_token_id)
+                                    and t.get("side") == "BUY"):
+                                real_size += float(t["size"])
+                    # 若沒有任何成交 → 跳過建倉
+                    if real_size < 0.001:
+                        send("⚠️ MATCHED 但實際成交 = 0（掛單未吃單），跳過建倉")
+                        continue
+                    # 寫入倉位（用真實成交量 real_size）
+                    open_positions[target_token_id] = {
+                        "entry_price":  fill_price,
+                        "size":         real_size,
+                        "question":     q,
+                        "opened_at":    datetime.datetime.now(datetime.timezone.utc),
+                        "entry_spread": spread,
+                        "time_left":    time_left,
+                        "tp_pct":       tp_pct,
+                        "sl_pct":       sl_pct,
+                    }
+                    send(f"📥 建倉成功 {dir_str} | {real_size:.2f} 份 "
+                         f"@ {fill_price:.3f} | 剩餘 {int(time_left)}s")
+                    return
+
+            except Exception as e:
+                print(f"     ❌ 下單異常: {e}")
+
+        print("🔎 本輪掃描完畢，無符合條件的標的")
+
+    except Exception as e:
+        print(f"❌ 分析循環錯誤: {e}")
+    finally:
+        _analyze_lock.release()
