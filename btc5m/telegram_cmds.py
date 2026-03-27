@@ -1,10 +1,17 @@
 """
-btc5m.telegram_cmds — Telegram Bot 指令處理（/close_all, /positions）
+btc5m.telegram_cmds — Telegram Bot 指令處理（/close_all, /positions, /status）
 """
 
+import time
+import datetime
 import threading
 
-from btc5m.config import BOT, CHAT_ID, FUNDER_ADDRESS, client, open_positions, _positions_lock
+from btc5m.config import (
+    BOT, CHAT_ID, FUNDER_ADDRESS, client,
+    open_positions, _positions_lock,
+    MAX_POSITIONS, POS_MAX_HOLD_SEC, START_CAPITAL,
+)
+from btc5m.utils import _api_call_with_timeout, _parse_orderbook, get_daily_realized_pnl
 from btc5m.trading import _close_position
 
 
@@ -31,40 +38,104 @@ def cmd_close_all(message):
 def cmd_positions(message):
     if str(message.chat.id) != CHAT_ID:
         return
-    trades = client.get_trades()
-    positions = {}
 
-    # 計算真實持倉
-    for t in trades:
-        maker = str(t.get("maker") or t.get("maker_address") or "")
-        if maker.lower() == FUNDER_ADDRESS.lower():
-            tid = str(t["token_id"])
-            size = float(t["size"])
-            side = t["side"]
+    # 先顯示 Bot 內部追蹤的活躍持倉（包含即時浮動損益）
+    with _positions_lock:
+        active = dict(open_positions)
 
-            positions.setdefault(tid, 0)
-            if side == "BUY":
-                positions[tid] += size
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+
+    if active:
+        msg = f"📊 *活躍持倉 ({len(active)}/{MAX_POSITIONS})*\n{'─'*28}\n"
+        total_upnl = 0.0
+        for tid, pos in active.items():
+            hold_sec = int((now_dt - pos["opened_at"]).total_seconds())
+            # 嘗試取得即時市價
+            try:
+                book = _api_call_with_timeout(client.get_order_book, tid)
+                best_bid, _ = _parse_orderbook(book)
+            except Exception:
+                best_bid = None
+
+            entry = pos["entry_price"]
+            size  = pos["size"]
+
+            if best_bid is not None:
+                upnl = (best_bid - entry) * size
+                upnl_pct = (best_bid - entry) / entry * 100
+                total_upnl += upnl
+                price_str = f"現價: `{best_bid:.3f}`"
+                pnl_str = f"浮動: `{upnl:+.4f}` USDC (`{upnl_pct:+.1f}%`)"
             else:
-                positions[tid] -= size
+                price_str = "現價: `N/A`"
+                pnl_str = "浮動: `N/A`"
 
-    # 過濾掉 0 倉位
-    positions = {k: v for k, v in positions.items() if abs(v) > 0.0001}
+            msg += (
+                f"• `{pos.get('question', 'N/A')[:35]}`\n"
+                f"  進場: `{entry:.3f}` | {price_str}\n"
+                f"  數量: `{size:.2f}` 份 | 持倉: `{hold_sec}s`\n"
+                f"  {pnl_str}\n"
+                f"  TP: `{pos['tp_pct']*100:.0f}%` / SL: `{pos['sl_pct']*100:.0f}%`\n\n"
+            )
+        msg += f"{'─'*28}\n💰 總浮動 PnL: `{total_upnl:+.4f}` USDC"
+    else:
+        msg = "📭 目前沒有活躍持倉"
 
-    if not positions:
-        BOT.reply_to(message, "📭 目前沒有任何持倉（真實成交量 = 0）")
-        return
-
-    # 整理文字輸出
-    msg = "📊 *真實持倉（成交統計）*\n"
-    for tid, sz in positions.items():
-        msg += f"• Token `{tid[:10]}…` 份數: `{sz:.4f}`\n"
+    # 再顯示鏈上成交統計
+    try:
+        trades = client.get_trades()
+        chain_positions = {}
+        for t in trades:
+            maker = str(t.get("maker") or t.get("maker_address") or "")
+            if maker.lower() == FUNDER_ADDRESS.lower():
+                tid_str = str(t["token_id"])
+                sz = float(t["size"])
+                side = t["side"]
+                chain_positions.setdefault(tid_str, 0)
+                if side == "BUY":
+                    chain_positions[tid_str] += sz
+                else:
+                    chain_positions[tid_str] -= sz
+        chain_positions = {k: v for k, v in chain_positions.items() if abs(v) > 0.0001}
+        if chain_positions:
+            msg += f"\n\n📈 *鏈上成交統計*\n"
+            for tid_str, sz in chain_positions.items():
+                msg += f"• `{tid_str[:12]}…` → `{sz:.4f}` 份\n"
+    except Exception:
+        pass
 
     BOT.reply_to(message, msg, parse_mode="Markdown")
 
 
+@BOT.message_handler(commands=["status"])
+def cmd_status(message):
+    if str(message.chat.id) != CHAT_ID:
+        return
+    pnl_today = get_daily_realized_pnl()
+    with _positions_lock:
+        pos_count = len(open_positions)
+
+    import btc5m.config as cfg
+    now = time.time()
+    with cfg._pause_until_lock:
+        pause = cfg._pause_until
+    paused = now < pause
+
+    msg = (
+        f"🤖 *Bot 狀態報告*\n"
+        f"{'─'*28}\n"
+        f"⏰ {datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')} HKT\n"
+        f"📊 持倉: `{pos_count}/{MAX_POSITIONS}`\n"
+        f"💰 今日 PnL: `{pnl_today:+.4f}` USDC\n"
+        f"📈 資本基準: `{START_CAPITAL}` USDC\n"
+        f"🛡️ 熔斷狀態: `{'❌ 暫停中 (剩餘 ' + str(int(pause - now)) + 's)' if paused else '✅ 正常運行'}`\n"
+        f"{'─'*28}"
+    )
+    BOT.reply_to(message, msg, parse_mode="Markdown")
+
+
 # ======================================================
-# 🚀  啟動背景監聽
+# 🚀  啟動背景監聯
 # ======================================================
 
 def start_polling():

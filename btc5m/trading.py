@@ -85,7 +85,10 @@ def _close_position(token_id: str):
         if not success:
             err = (getattr(resp, "errorMsg", "")
                    or (resp.get("errorMsg", "") if isinstance(resp, dict) else ""))
-            send(f"⚠️ 平倉下單失敗: {err}")
+            send(f"⚠️ 平倉下單失敗\n"
+                 f"Token: {token_id[:12]}…\n"
+                 f"持倉: {size:.2f} 份 @ {entry_price:.3f}\n"
+                 f"錯誤: {err}")
             return
 
         oid        = _get_order_id(resp)
@@ -94,7 +97,10 @@ def _close_position(token_id: str):
         if oid:
             filled, exit_price = _poll_order_matched(oid, limit_price)
             if not filled:
-                send(f"⚠️ 平倉訂單 {oid[:12]}… 超時未成交")
+                send(f"⚠️ 平倉訂單超時未成交\n"
+                     f"訂單 ID: {oid[:16]}…\n"
+                     f"Token: {token_id[:12]}…\n"
+                     f"嘗試賣出: {safe_size:.2f} 份 @ {limit_price:.3f}")
         else:
             send("⚠️ 無法取得平倉訂單 ID，以限價估算退出價格")
 
@@ -113,9 +119,19 @@ def _close_position(token_id: str):
             "realized_pnl": round(realized_pnl, 4),
             "status":       "closed",
         })
-        send(f"📤 平倉 {token_id[:8]}… "
-             f"進@{entry_price:.3f} 出@{exit_price:.3f} "
-             f"PnL: {realized_pnl:+.4f} USDC")
+        hold_time = (datetime.datetime.now(datetime.timezone.utc)
+                     - pos["opened_at"]).total_seconds()
+        pnl_pct = (realized_pnl / (entry_price * size) * 100) if (entry_price * size) else 0
+        pnl_emoji = "🟢" if realized_pnl >= 0 else "🔴"
+        send(f"📤 平倉完成\n"
+             f"{'─'*28}\n"
+             f"📋 {pos.get('question', 'N/A')[:40]}\n"
+             f"Token: {token_id[:12]}…\n"
+             f"進場: {entry_price:.3f} → 出場: {exit_price:.3f}\n"
+             f"數量: {size:.2f} 份 | 持倉: {int(hold_time)}s\n"
+             f"滑點: {slippage_pct*100:.3f}%\n"
+             f"{pnl_emoji} PnL: {realized_pnl:+.4f} USDC ({pnl_pct:+.2f}%)\n"
+             f"{'─'*28}")
 
         with _positions_lock:
             open_positions.pop(token_id, None)
@@ -127,8 +143,14 @@ def _close_position(token_id: str):
                 if cfg._consecutive_losses >= CONSECUTIVE_LOSS_LIMIT:
                     with _pause_until_lock:
                         cfg._pause_until = time.time() + PAUSE_AFTER_LOSS_SEC
-                    send(f"🛡️ 熔斷：連虧 {cfg._consecutive_losses} 次，"
-                         f"暫停 {PAUSE_AFTER_LOSS_SEC // 60} 分鐘")
+                    pnl_today = get_daily_realized_pnl()
+                    send(f"🛡️ 熔斷觸發！\n"
+                         f"{'─'*28}\n"
+                         f"連續虧損: {cfg._consecutive_losses} 次\n"
+                         f"暫停時間: {PAUSE_AFTER_LOSS_SEC // 60} 分鐘\n"
+                         f"今日累計 PnL: {pnl_today:+.4f} USDC\n"
+                         f"預計恢復: {datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime('%H:%M:%S')} + {PAUSE_AFTER_LOSS_SEC // 60}min\n"
+                         f"{'─'*28}")
                     cfg._consecutive_losses = 0
             else:
                 cfg._consecutive_losses = 0
@@ -189,7 +211,16 @@ def manage_positions():
                 reason = "⏰ 結算規避/超時"
 
             if reason:
-                send(f"{reason} | {pos['question'][:25]} | 現價 {best_bid:.3f}")
+                unrealized_pnl = (best_bid - entry_price) * pos["size"]
+                upnl_pct = unrealized_pct * 100
+                send(f"{reason}\n"
+                     f"{'─'*28}\n"
+                     f"📋 {pos['question'][:40]}\n"
+                     f"進場: {entry_price:.3f} → 現價: {best_bid:.3f}\n"
+                     f"浮動 PnL: {unrealized_pnl:+.4f} USDC ({upnl_pct:+.2f}%)\n"
+                     f"持倉時間: {int(hold_seconds)}s / {int(max_hold)}s\n"
+                     f"TP: {tp_target:.3f} | SL: {sl_target:.3f}\n"
+                     f"{'─'*28}")
                 _close_position(token_id)
                 _recently_closed[token_id] = time.time()
                 _clean_recently_closed()
@@ -225,10 +256,14 @@ def analyze_and_trade():
         # 每日風控
         pnl_today = get_daily_realized_pnl()
         if pnl_today < -START_CAPITAL * DAILY_MAX_LOSS:
-            send("🚫 已觸及單日最大虧損，今日停止交易")
+            send(f"🚫 已觸及單日最大虧損，今日停止交易\n"
+                 f"今日 PnL: {pnl_today:+.4f} USDC\n"
+                 f"虧損上限: {-START_CAPITAL * DAILY_MAX_LOSS:.2f} USDC")
             return
         if pnl_today > START_CAPITAL * DAILY_TAKE_PROFIT:
-            send("🏆 已達單日止盈目標，今日停止交易")
+            send(f"🏆 已達單日止盈目標，今日停止交易\n"
+                 f"今日 PnL: {pnl_today:+.4f} USDC\n"
+                 f"止盈目標: {START_CAPITAL * DAILY_TAKE_PROFIT:.2f} USDC")
             return
 
         # 持倉上限
@@ -243,7 +278,18 @@ def analyze_and_trade():
             return  # 診斷輸出已在 get_btc_signals() 內完成
 
         dir_str = "看漲 (買UP/YES)" if signal_dir == 1 else "看跌 (買DOWN/NO)"
-        send(f"⚡ 捕捉到大盤 {dir_str} 信號！(ADX:{btc_info['adx']:.1f})")
+        score = btc_info['bull_score'] if signal_dir == 1 else btc_info['bear_score']
+        conf_tag = " 🔥高信心" if btc_info.get('high_conf') else ""
+        send(f"⚡ 捕捉到信號！{conf_tag}\n"
+             f"{'─'*28}\n"
+             f"方向: {dir_str}\n"
+             f"積分: 🐂{btc_info['bull_score']} / 🐻{btc_info['bear_score']}\n"
+             f"BTC: ${btc_info['close']:,.1f}\n"
+             f"RSI: {btc_info['rsi']:.1f} | ADX: {btc_info['adx']:.1f} | ATR: {btc_info['atr']:.2f}\n"
+             f"趨勢: {'多頭' if btc_info['trend_bullish'] else '空頭'} | "
+             f"MACD: {'擴展✅' if btc_info['bull_exp'] or btc_info['bear_exp'] else '收斂❌'} | "
+             f"放量: {'✅' if btc_info['vol_ok'] else '❌'}\n"
+             f"{'─'*28}")
 
         # 透過 Series API 動態取得當前窗口子市場
         markets = fetch_active_btc5m_markets()
@@ -338,11 +384,20 @@ def analyze_and_trade():
                 limit_price = round(
                     min(best_bid + spread * 0.5 * (1 + SLIPPAGE), best_ask), 3)
 
-                send(f"💡 鎖定標的: {q[:35]}\n"
-                     f"方向: {dir_str} ({outcome_label}) | Ask: {best_ask:.3f}\n"
-                     f"R:R 比: {rr_ratio:.1f} "
-                     f"(TP:{tp_pct*100:.0f}% / SL:{sl_pct*100:.0f}%)\n"
-                     f"下單量: {size:.2f} 份 @ {limit_price:.3f}")
+                cost_usdc = size * limit_price
+                tp_price = entry_price + pos.get("entry_spread", spread) * tp_pct if False else limit_price + spread * tp_pct
+                sl_price = limit_price * (1 - sl_pct)
+                send(f"💡 鎖定標的\n"
+                     f"{'─'*28}\n"
+                     f"📋 {q[:45]}\n"
+                     f"方向: {dir_str} ({outcome_label})\n"
+                     f"Bid: {best_bid:.3f} | Ask: {best_ask:.3f} | 價差: {spread:.4f}\n"
+                     f"限價: {limit_price:.3f} | 數量: {size:.2f} 份\n"
+                     f"預估成本: ~{cost_usdc:.2f} USDC\n"
+                     f"TP: {tp_pct*100:.0f}% → ~{limit_price + spread * tp_pct:.3f}\n"
+                     f"SL: {sl_pct*100:.0f}% → ~{sl_price:.3f}\n"
+                     f"R:R 比: {rr_ratio:.1f} | 剩餘: {int(time_left)}s\n"
+                     f"{'─'*28}")
 
                 order_args   = OrderArgs(price=limit_price, size=size,
                                          side=BUY, token_id=target_token_id)
@@ -400,8 +455,20 @@ def analyze_and_trade():
                         "tp_pct":       tp_pct,
                         "sl_pct":       sl_pct,
                     }
-                    send(f"📥 建倉成功 {dir_str} | {real_size:.2f} 份 "
-                         f"@ {fill_price:.3f} | 剩餘 {int(time_left)}s")
+                    cost_usdc = real_size * fill_price
+                    tp_target = fill_price + spread * tp_pct
+                    sl_target_price = fill_price * (1 - sl_pct)
+                    send(f"📥 建倉成功！\n"
+                         f"{'─'*28}\n"
+                         f"📋 {q[:45]}\n"
+                         f"方向: {dir_str} ({outcome_label})\n"
+                         f"成交: {real_size:.2f} 份 @ {fill_price:.3f}\n"
+                         f"成本: ~{cost_usdc:.2f} USDC\n"
+                         f"TP: {tp_target:.3f} ({tp_pct*100:.0f}%)\n"
+                         f"SL: {sl_target_price:.3f} ({sl_pct*100:.0f}%)\n"
+                         f"最大持倉: {int(min(POS_MAX_HOLD_SEC, max(time_left - 30, 30)))}s | "
+                         f"窗口剩餘: {int(time_left)}s\n"
+                         f"{'─'*28}")
                     return
 
             except Exception as e:
