@@ -10,7 +10,7 @@ from py_clob_client.order_builder.constants import BUY, SELL
 
 import btc5m.config as cfg
 from btc5m.config import (
-    client, FUNDER_ADDRESS,
+    client,
     MAX_USD, SLIPPAGE, ORDER_TIMEOUT, MIN_SPREAD, MAX_SPREAD,
     START_CAPITAL, DAILY_MAX_LOSS, DAILY_TAKE_PROFIT,
     POS_MAX_HOLD_SEC, MAX_POSITIONS, COOLDOWN_SEC,
@@ -35,22 +35,47 @@ from btc5m.signals import get_btc_signals
 def _poll_order_matched(oid: str, fallback_price: float) -> tuple:
     """
     輪詢訂單狀態直到成交或超時。
-    回傳 (成交成功: bool, 成交估算價: float)
+    回傳 (成交成功: bool, 成交估算價: float, 實際成交量: float)
     """
     t0 = time.time()
     while time.time() - t0 < ORDER_TIMEOUT:
         try:
             st = _api_call_with_timeout(client.get_order, oid)
-            status = (getattr(st, "status", "") if hasattr(st, "status") else st.get("status", ""))
-            print(f"🔍 訂單狀態 debug: {status}")
-            if status in ("ORDER_STATUS_MATCHED", "MATCHED"):
-                return True, fallback_price
-            if status in ("ORDER_STATUS_PARTIALLY_FILLED", "PARTIALLY_MATCHED"):
-                return True, fallback_price
-        except Exception:
-            pass
+            status = (getattr(st, "status", "") if hasattr(st, "status")
+                      else st.get("status", ""))
+
+            # 提取 size_matched（實際成交量）
+            size_matched = 0.0
+            if hasattr(st, "size_matched"):
+                size_matched = float(st.size_matched or 0)
+            elif isinstance(st, dict):
+                size_matched = float(st.get("size_matched") or 0)
+
+            # 嘗試取得成交均價
+            avg_price = fallback_price
+            if hasattr(st, "price") and st.price:
+                try:
+                    avg_price = float(st.price)
+                except (ValueError, TypeError):
+                    pass
+            elif isinstance(st, dict) and st.get("price"):
+                try:
+                    avg_price = float(st["price"])
+                except (ValueError, TypeError):
+                    pass
+
+            print(f"🔍 訂單狀態: {status} | size_matched: {size_matched}")
+
+            if status in ("MATCHED", "ORDER_STATUS_MATCHED",
+                          "FILLED", "ORDER_STATUS_FILLED"):
+                return True, avg_price, size_matched
+            if status in ("PARTIALLY_MATCHED", "ORDER_STATUS_PARTIALLY_FILLED",
+                          "PARTIALLY_FILLED"):
+                return True, avg_price, size_matched
+        except Exception as e:
+            print(f"🔍 輪詢異常: {e}")
         time.sleep(2)
-    return False, fallback_price
+    return False, fallback_price, 0.0
 
 
 # ======================================================
@@ -95,7 +120,7 @@ def _close_position(token_id: str):
         exit_price = limit_price  # 估算值
 
         if oid:
-            filled, exit_price = _poll_order_matched(oid, limit_price)
+            filled, exit_price, _ = _poll_order_matched(oid, limit_price)
             if not filled:
                 send(f"⚠️ 平倉訂單超時未成交\n"
                      f"訂單 ID: {oid[:16]}…\n"
@@ -420,7 +445,8 @@ def analyze_and_trade():
                 send(f"📨 訂單已送出 ID: {oid[:16]}…，等待成交…")
 
                 # 輪詢等待成交；超時則取消訂單
-                filled, fill_price = _poll_order_matched(oid, limit_price)
+                filled, fill_price, size_matched = _poll_order_matched(
+                    oid, limit_price)
                 if not filled:
                     try:
                         _api_call_with_timeout(client.cancel_order, oid)
@@ -430,21 +456,12 @@ def analyze_and_trade():
                     continue
 
                 # === 建倉成功：寫入倉位 ===
+                # 使用 size_matched（訂單自身的成交量），比 get_trades 更可靠
+                real_size = size_matched if size_matched > 0.001 else size
+                if size_matched < 0.001:
+                    send(f"⚠️ size_matched={size_matched}，使用下單量 {size} 作為持倉量")
+
                 with _positions_lock:
-                    # 查詢真實成交量
-                    trades = client.get_trades()
-                    real_size = 0.0
-                    for t in trades:
-                        maker = str(t.get("maker") or t.get("maker_address") or "")
-                        if maker.lower() == FUNDER_ADDRESS.lower():
-                            if (str(t.get("token_id")) == str(target_token_id)
-                                    and t.get("side") == "BUY"):
-                                real_size += float(t["size"])
-                    # 若沒有任何成交 → 跳過建倉
-                    if real_size < 0.001:
-                        send("⚠️ MATCHED 但實際成交 = 0（掛單未吃單），跳過建倉")
-                        continue
-                    # 寫入倉位（用真實成交量 real_size）
                     open_positions[target_token_id] = {
                         "entry_price":  fill_price,
                         "size":         real_size,
@@ -455,24 +472,24 @@ def analyze_and_trade():
                         "tp_pct":       tp_pct,
                         "sl_pct":       sl_pct,
                     }
-                    cost_usdc = real_size * fill_price
-                    tp_target = fill_price + spread * tp_pct
-                    sl_target_price = fill_price * (1 - sl_pct)
-                    send(f"📥 建倉成功！\n"
-                         f"{'─'*28}\n"
-                         f"📋 {q[:45]}\n"
-                         f"方向: {dir_str} ({outcome_label})\n"
-                         f"成交: {real_size:.2f} 份 @ {fill_price:.3f}\n"
-                         f"成本: ~{cost_usdc:.2f} USDC\n"
-                         f"TP: {tp_target:.3f} ({tp_pct*100:.0f}%)\n"
-                         f"SL: {sl_target_price:.3f} ({sl_pct*100:.0f}%)\n"
-                         f"最大持倉: {int(min(POS_MAX_HOLD_SEC, max(time_left - 30, 30)))}s | "
-                         f"窗口剩餘: {int(time_left)}s\n"
-                         f"{'─'*28}")
-                    return
+                cost_usdc = real_size * fill_price
+                tp_target = fill_price + spread * tp_pct
+                sl_target_price = fill_price * (1 - sl_pct)
+                send(f"📥 建倉成功！\n"
+                     f"{'─'*28}\n"
+                     f"📋 {q[:45]}\n"
+                     f"方向: {dir_str} ({outcome_label})\n"
+                     f"成交: {real_size:.2f} 份 @ {fill_price:.3f}\n"
+                     f"成本: ~{cost_usdc:.2f} USDC\n"
+                     f"TP: {tp_target:.3f} ({tp_pct*100:.0f}%)\n"
+                     f"SL: {sl_target_price:.3f} ({sl_pct*100:.0f}%)\n"
+                     f"最大持倉: {int(min(POS_MAX_HOLD_SEC, max(time_left - 30, 30)))}s | "
+                     f"窗口剩餘: {int(time_left)}s\n"
+                     f"{'─'*28}")
+                return
 
             except Exception as e:
-                print(f"     ❌ 下單異常: {e}")
+                send(f"❌ 下單異常: {e}")
 
         print("🔎 本輪掃描完畢，無符合條件的標的")
 

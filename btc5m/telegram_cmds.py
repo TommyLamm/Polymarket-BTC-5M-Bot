@@ -86,11 +86,14 @@ def cmd_positions(message):
         trades = client.get_trades()
         chain_positions = {}
         for t in trades:
-            maker = str(t.get("maker") or t.get("maker_address") or "")
-            if maker.lower() == FUNDER_ADDRESS.lower():
+            # 檢查 maker 和 taker 兩邊（吃單方=taker）
+            maker = str(t.get("maker") or t.get("maker_address") or "").lower()
+            taker = str(t.get("taker") or t.get("taker_address") or "").lower()
+            funder = FUNDER_ADDRESS.lower()
+            if maker == funder or taker == funder:
                 tid_str = str(t["token_id"])
                 sz = float(t["size"])
-                side = t["side"]
+                side = t.get("side", "")
                 chain_positions.setdefault(tid_str, 0)
                 if side == "BUY":
                     chain_positions[tid_str] += sz
