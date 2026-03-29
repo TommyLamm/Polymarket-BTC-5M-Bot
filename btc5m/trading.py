@@ -226,21 +226,22 @@ def _close_position(token_id: str, reason: str = None, tp_target: float = None, 
                      - pos["opened_at"]).total_seconds()
 
         if "not enough balance" in err_str:
-            if hold_time > 20:
-                # 持倉超過 20 秒仍無餘額 → 鏈上結算失敗，確認為幻覺持倉
-                send(f"👻 幻覺持倉已清除\n"
+            # 用即時的 open_positions 檢查 phantom_warned，避免 copy() 快照問題
+            with _positions_lock:
+                already_warned = open_positions.get(token_id, {}).get("phantom_warned", False)
+            if hold_time > 60 and not already_warned:
+                with _positions_lock:
+                    if token_id in open_positions:
+                        open_positions[token_id]["phantom_warned"] = True
+                send(f"👻 警告：持倉已 {int(hold_time)} 秒仍無餘額！\n"
                      f"{'─'*28}\n"
                      f"📋 {pos.get('question', 'N/A')[:40]}\n"
                      f"Token: {token_id[:12]}…\n"
-                     f"原因: 買入時 MATCHED 但鏈上結算失敗\n"
-                     f"持倉時間: {int(hold_time)}s\n"
+                     f"可能遭遇 Polygon 網路嚴重擁塞，或結算已徹底失敗。\n"
+                     f"Bot 會繼續為您監測，直到市場結束。\n"
                      f"{'─'*28}")
-                with _positions_lock:
-                    open_positions.pop(token_id, None)
-                _recently_closed[token_id] = time.time()
             else:
-                # 剛買入不久，可能鏈上結算還在進行中
-                print(f"⏳ 等待鏈上結算... ({int(hold_time)}s / 20s)")
+                print(f"⏳ 等待鏈上結算到帳... ({int(hold_time)}s)")
         else:
             send(f"❌ 平倉異常: {e}\nToken: {token_id[:12]}…")
             traceback.print_exc()
@@ -268,6 +269,19 @@ def manage_positions():
         for token_id, pos in tokens:
             entry_price  = pos["entry_price"]
             hold_seconds = (now_dt - pos["opened_at"]).total_seconds()
+            
+            # 絕對超時防呆清除：市場結束後再等 3 分鐘仍在追蹤則強制清除
+            # pos["time_left"] 是建倉時的市場剩餘秒數
+            # 市場結束後經過的秒數 = hold_seconds - time_left (確保非負)
+            time_since_market_end = hold_seconds - pos["time_left"]
+            if time_since_market_end > 180:  # 市場結算後超過 3 分鐘
+                send(f"🧹 市場結算超時，自動清除本地追蹤\n"
+                     f"📋 {pos.get('question', 'N/A')[:40]}\n"
+                     f"持倉時間: {int(hold_seconds)}s | 市場已結算約: {int(time_since_market_end)}s 前\n"
+                     f"（請至 Polymarket 查看結算結果）")
+                with _positions_lock:
+                    open_positions.pop(token_id, None)
+                continue
 
             try:
                 book = _api_call_with_timeout(client.get_order_book, token_id)
