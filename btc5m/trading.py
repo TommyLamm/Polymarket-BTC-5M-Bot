@@ -94,12 +94,21 @@ def _close_position(token_id: str):
         book = _api_call_with_timeout(client.get_order_book, token_id)
         best_bid, best_ask = _parse_orderbook(book)
         if best_bid is None or best_ask is None:
+            send(f"⚠️ 平倉失敗：訂單簿無流動性\n"
+                 f"Token: {token_id[:12]}…\n"
+                 f"持倉: {size:.2f} 份 @ {entry_price:.3f}")
             return
 
-        # 市價賣出：直接吃 ask，增加 0.001 讓它一定成交
-        limit_price = round(best_ask + 0.001, 3)
+        # 市價賣出：掛在 best_bid 下方，確保立即成交
+        # Polymarket CLOB: SELL 掛單價 <= best_bid 時立即被吃單
+        limit_price = round(max(best_bid - 0.01, 0.01), 3)
         # 確保賣出量不超過實際持倉（避免 not enough balance）
         safe_size    = round(min(size, size * 0.99), 2)
+        if safe_size < 0.01:
+            safe_size = size  # 數量太小時不再縮減
+
+        print(f"📤 平倉下單: price={limit_price} size={safe_size} bid={best_bid} ask={best_ask}")
+
         order_args   = OrderArgs(price=limit_price, size=safe_size,
                                  side=SELL, token_id=token_id)
         signed_order = _api_call_with_timeout(client.create_order, order_args)
@@ -113,6 +122,7 @@ def _close_position(token_id: str):
             send(f"⚠️ 平倉下單失敗\n"
                  f"Token: {token_id[:12]}…\n"
                  f"持倉: {size:.2f} 份 @ {entry_price:.3f}\n"
+                 f"賣出價: {limit_price} | bid: {best_bid} | ask: {best_ask}\n"
                  f"錯誤: {err}")
             return
 
@@ -181,7 +191,9 @@ def _close_position(token_id: str):
                 cfg._consecutive_losses = 0
 
     except Exception as e:
-        print(f"❌ 平倉異常: {e}")
+        send(f"❌ 平倉異常: {e}\nToken: {token_id[:12]}…")
+        import traceback
+        traceback.print_exc()
 
 
 # ======================================================
@@ -210,10 +222,30 @@ def manage_positions():
             try:
                 book = _api_call_with_timeout(client.get_order_book, token_id)
                 best_bid, _ = _parse_orderbook(book)
-            except Exception:
+            except Exception as e:
+                print(f"📊 持倉監控 - 訂單簿查詢失敗: {e} | token={token_id[:12]}…")
+                # 如果持倉超過 5 分鐘且訂單簿無法查詢，市場可能已結算
+                if hold_seconds > 330:
+                    send(f"🏁 市場已結算（訂單簿查詢失敗）\n"
+                         f"📋 {pos.get('question', 'N/A')[:40]}\n"
+                         f"持倉時間: {int(hold_seconds)}s\n"
+                         f"自動清除持倉記錄")
+                    with _positions_lock:
+                        open_positions.pop(token_id, None)
                 continue
 
             if best_bid is None:
+                # 訂單簿為空，可能市場已結算
+                if hold_seconds > 330:
+                    send(f"🏁 市場已結算（訂單簿為空）\n"
+                         f"📋 {pos.get('question', 'N/A')[:40]}\n"
+                         f"進場: {entry_price:.3f} | 數量: {pos['size']:.2f}\n"
+                         f"持倉時間: {int(hold_seconds)}s\n"
+                         f"自動清除持倉記錄，請到 Polymarket 領取結算獎金")
+                    with _positions_lock:
+                        open_positions.pop(token_id, None)
+                else:
+                    print(f"⚠️ 訂單簿為空但未超時 ({int(hold_seconds)}s) | token={token_id[:12]}…")
                 continue
 
             tp_target = entry_price + pos["entry_spread"] * pos["tp_pct"]
