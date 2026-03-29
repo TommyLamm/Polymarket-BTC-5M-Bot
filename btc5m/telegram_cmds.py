@@ -91,7 +91,10 @@ def cmd_positions(message):
             taker = str(t.get("taker") or t.get("taker_address") or "").lower()
             funder = FUNDER_ADDRESS.lower()
             if maker == funder or taker == funder:
-                tid_str = str(t["token_id"])
+                raw_tid = t.get("token_id") or t.get("asset_id") or t.get("tokenId")
+                if not raw_tid:
+                    continue
+                tid_str = str(raw_tid)
                 sz = float(t["size"])
                 side = t.get("side", "")
                 chain_positions.setdefault(tid_str, 0)

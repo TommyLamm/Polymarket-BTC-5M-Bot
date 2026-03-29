@@ -73,8 +73,12 @@ def get_all_positions():
         if maker != funder_lower and taker != funder_lower:
             continue
 
-        tid = str(t["token_id"])
-        sz = float(t["size"])
+        raw_tid = t.get("token_id") or t.get("asset_id") or t.get("tokenId")
+        if not raw_tid:
+            continue
+            
+        tid = str(raw_tid)
+        sz = float(t.get("size", 0))
         side = t.get("side", "")
         price = float(t.get("price", 0))
 
