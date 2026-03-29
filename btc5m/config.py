@@ -73,14 +73,14 @@ client = _init_client()
 # ======================================================
 # 📊  全局交易參數
 # ======================================================
-MAX_USD           = 10      # 每次最大下單金額 (USDC)
-DAILY_MAX_LOSS    = 0.05    # 單日最大損失比例 (5%)
-DAILY_TAKE_PROFIT = 0.05    # 單日止盈比例 (5%)
+MAX_USD           = 2      # 每次最大下單金額 (USDC)
+DAILY_MAX_LOSS    = 0.5    # 單日最大損失比例 (50%)
+DAILY_TAKE_PROFIT = 0.5    # 單日止盈比例 (50%)
 SLIPPAGE          = 0.015   # 最大容許滑點 (1.5%)
 ORDER_TIMEOUT     = 10      # 訂單輪詢超時秒數
 MIN_SPREAD        = 0.015   # 最小有效買賣價差
 MAX_SPREAD        = 0.2     # 最大容許買賣價差
-START_CAPITAL     = 700     # 初始資本基準（用於計算每日風控門檻）
+START_CAPITAL     = 75     # 初始資本基準（用於計算每日風控門檻）
 
 # ======================================================
 # 🛡️  風控與持倉參數
@@ -98,6 +98,11 @@ _recently_closed: dict   = {}    # {token_id: 平倉時間戳}
 _consecutive_losses: int = 0
 _pause_until: float      = 0.0
 
+stats_signals_up: int    = 0
+stats_signals_down: int  = 0
+stats_orders_placed: int = 0
+
+_stats_lock              = threading.Lock()
 _pause_until_lock        = threading.Lock()
 _consecutive_losses_lock = threading.Lock()
 _manage_lock             = threading.Lock()
