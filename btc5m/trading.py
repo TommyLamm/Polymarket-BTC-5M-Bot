@@ -84,12 +84,26 @@ def _poll_order_matched(oid: str, fallback_price: float) -> tuple:
 # ======================================================
 
 def _close_position(token_id: str, reason: str = None, tp_target: float = None, sl_target: float = None):
-    """以市價賣出平倉，並增加防插針滑點保護，超時則取消。"""
+    """以市價賣出平倉。5 分鐘二元市場必須果斷出場，不做任何限價保護。"""
     with _positions_lock:
         if token_id not in open_positions:
             return
         pos = open_positions[token_id].copy()
         size, entry_price = pos["size"], pos["entry_price"]
+        # 如果有未取消的掛單，先取消再下新單
+        pending_oid = pos.get("pending_sell_oid")
+
+    # 先取消任何殘留的未成交賣單（釋放被鎖定的代幣）
+    if pending_oid:
+        try:
+            _api_call_with_timeout(client.cancel, pending_oid)
+            print(f"🗑️ 已取消殘留掛單: {pending_oid[:16]}…")
+        except Exception as ce:
+            print(f"⚠️ 取消殘留掛單失敗: {ce}")
+        with _positions_lock:
+            if token_id in open_positions:
+                open_positions[token_id].pop("pending_sell_oid", None)
+        time.sleep(1)  # 等待取消生效
 
     try:
         book = _api_call_with_timeout(client.get_order_book, token_id)
@@ -100,25 +114,13 @@ def _close_position(token_id: str, reason: str = None, tp_target: float = None, 
                  f"持倉: {size:.2f} 份 @ {entry_price:.3f}")
             return
 
-        # 市價賣出：掛在 best_bid 下方，確保立即成交
+        # 5 分鐘二元市場策略：無條件果斷賣出，不設價格底線
+        # 掛在 best_bid 下方確保立即成交
         limit_price = max(best_bid - 0.01, 0.01)
-        
-        # 🛡️ 防插針滑點保護機制
-        if reason and "止損" in reason and sl_target is not None:
-            # 最多接受比預期止損價再低 5% 的滑點
-            min_acceptable = max(sl_target - 0.05, 0.01)
-            if limit_price < min_acceptable:
-                print(f"⚠️ 防插針保護：現價 {best_bid} 過低，改掛限價等候成交 ({min_acceptable})")
-                limit_price = min_acceptable
-        elif reason and "止盈" in reason and tp_target is not None:
-            min_acceptable = max(tp_target - 0.02, 0.01)
-            if limit_price < min_acceptable:
-                limit_price = min_acceptable
-
         limit_price = round(limit_price, 3)
 
         # 確保賣出量不超過實際持倉（避免 not enough balance）
-        safe_size    = round(min(size, size * 0.99), 2)
+        safe_size = round(min(size, size * 0.99), 2)
         if safe_size < 0.01:
             safe_size = size  # 數量太小時不再縮減
 
@@ -141,21 +143,25 @@ def _close_position(token_id: str, reason: str = None, tp_target: float = None, 
                  f"錯誤: {err}")
             return
 
-        oid        = _get_order_id(resp)
+        oid = _get_order_id(resp)
         exit_price = limit_price  # 估算值
 
         if oid:
             filled, exit_price, _ = _poll_order_matched(oid, limit_price)
             if not filled:
-                send(f"⚠️ 平倉訂單超時未成交，觸發取消 (保護機制)\n"
+                send(f"⚠️ 平倉訂單超時未成交，嘗試取消\n"
                      f"訂單 ID: {oid[:16]}…\n"
                      f"嘗試賣出: {safe_size:.2f} 份 @ {limit_price:.3f}")
                 try:
-                    # 取消未成交的掛單，避免鎖卡餘額
-                    _api_call_with_timeout(client.cancel_order, oid)
+                    _api_call_with_timeout(client.cancel, oid)
+                    print(f"🗑️ 已取消超時賣單: {oid[:16]}…")
                 except Exception as ce:
-                    print(f"⚠️ 取消平倉訂單失敗: {ce}")
-                return # 放棄本次平倉，交給下一次輪詢處理
+                    # 取消失敗 → 記錄掛單 ID，下次進來先取消
+                    print(f"⚠️ 取消賣單失敗: {ce}")
+                    with _positions_lock:
+                        if token_id in open_positions:
+                            open_positions[token_id]["pending_sell_oid"] = oid
+                return  # 放棄本次平倉，交給下一次輪詢處理
         else:
             send("⚠️ 無法取得平倉訂單 ID，以限價估算退出價格")
 
@@ -573,7 +579,7 @@ def analyze_and_trade():
                     oid, limit_price)
                 if not filled:
                     try:
-                        _api_call_with_timeout(client.cancel_order, oid)
+                        _api_call_with_timeout(client.cancel, oid)
                         send(f"⏰ 訂單 {oid[:12]}… 超時未成交，已取消")
                     except Exception:
                         pass
