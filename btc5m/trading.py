@@ -83,8 +83,8 @@ def _poll_order_matched(oid: str, fallback_price: float) -> tuple:
 # 📤  平倉邏輯
 # ======================================================
 
-def _close_position(token_id: str):
-    """以市價賣出平倉，更新損益統計與熔斷狀態。"""
+def _close_position(token_id: str, reason: str = None, tp_target: float = None, sl_target: float = None):
+    """以市價賣出平倉，並增加防插針滑點保護，超時則取消。"""
     with _positions_lock:
         if token_id not in open_positions:
             return
@@ -101,8 +101,22 @@ def _close_position(token_id: str):
             return
 
         # 市價賣出：掛在 best_bid 下方，確保立即成交
-        # Polymarket CLOB: SELL 掛單價 <= best_bid 時立即被吃單
-        limit_price = round(max(best_bid - 0.01, 0.01), 3)
+        limit_price = max(best_bid - 0.01, 0.01)
+        
+        # 🛡️ 防插針滑點保護機制
+        if reason and "止損" in reason and sl_target is not None:
+            # 最多接受比預期止損價再低 5% 的滑點
+            min_acceptable = max(sl_target - 0.05, 0.01)
+            if limit_price < min_acceptable:
+                print(f"⚠️ 防插針保護：現價 {best_bid} 過低，改掛限價等候成交 ({min_acceptable})")
+                limit_price = min_acceptable
+        elif reason and "止盈" in reason and tp_target is not None:
+            min_acceptable = max(tp_target - 0.02, 0.01)
+            if limit_price < min_acceptable:
+                limit_price = min_acceptable
+
+        limit_price = round(limit_price, 3)
+
         # 確保賣出量不超過實際持倉（避免 not enough balance）
         safe_size    = round(min(size, size * 0.99), 2)
         if safe_size < 0.01:
@@ -133,15 +147,28 @@ def _close_position(token_id: str):
         if oid:
             filled, exit_price, _ = _poll_order_matched(oid, limit_price)
             if not filled:
-                send(f"⚠️ 平倉訂單超時未成交\n"
+                send(f"⚠️ 平倉訂單超時未成交，觸發取消 (保護機制)\n"
                      f"訂單 ID: {oid[:16]}…\n"
-                     f"Token: {token_id[:12]}…\n"
                      f"嘗試賣出: {safe_size:.2f} 份 @ {limit_price:.3f}")
+                try:
+                    # 取消未成交的掛單，避免鎖卡餘額
+                    _api_call_with_timeout(client.cancel_order, oid)
+                except Exception as ce:
+                    print(f"⚠️ 取消平倉訂單失敗: {ce}")
+                return # 放棄本次平倉，交給下一次輪詢處理
         else:
             send("⚠️ 無法取得平倉訂單 ID，以限價估算退出價格")
 
         slippage_pct = round((exit_price - best_bid) / best_bid, 6) if best_bid else 0
-        realized_pnl = (exit_price - entry_price) * size
+        
+        # 估算 Polymarket 5m 短期市場 Taker Fee (雙向各約 1.56%)
+        # 因為手續費會直接從錢包扣 USDC，我們在 PnL 反映真實淨值
+        fee_rate = 0.0156
+        entry_fee = entry_price * size * fee_rate
+        exit_fee  = exit_price * size * fee_rate
+        total_fee = entry_fee + exit_fee
+        
+        realized_pnl = (exit_price - entry_price) * size - total_fee
 
         log_trade({
             "date":         datetime.date.today().isoformat(),
@@ -153,7 +180,9 @@ def _close_position(token_id: str):
             "size":         round(size, 2),
             "slippage_pct": slippage_pct,
             "realized_pnl": round(realized_pnl, 4),
+            "fees":         round(total_fee, 4),
             "status":       "closed",
+            "hold_time":    (datetime.datetime.now(datetime.timezone.utc) - pos["opened_at"]).total_seconds()
         })
         hold_time = (datetime.datetime.now(datetime.timezone.utc)
                      - pos["opened_at"]).total_seconds()
@@ -269,7 +298,11 @@ def manage_positions():
                     print(f"⚠️ 訂單簿為空但未超時 ({int(hold_seconds)}s) | token={token_id[:12]}…")
                 continue
 
-            tp_target = entry_price + pos["entry_spread"] * pos["tp_pct"]
+            # 強制轉換為進場價的絕對百分比，且設置 0.99 上限（代幣最大價值為 1 鎂）
+            tp_target = min(entry_price * (1 + pos["tp_pct"]), 0.99)
+            if tp_target <= entry_price:
+                tp_target = entry_price + 0.01 # 防呆機制，確保有獲利空間
+                
             sl_target = entry_price * (1 - pos["sl_pct"])
 
             unrealized_pct = (best_bid - entry_price) / entry_price
@@ -289,18 +322,23 @@ def manage_positions():
                 reason = "⏰ 結算規避/超時"
 
             if reason:
-                unrealized_pnl = (best_bid - entry_price) * pos["size"]
+                fee_rate = 0.0156
+                est_fee = entry_price * pos["size"] * fee_rate + best_bid * pos["size"] * fee_rate
+                net_unrealized_pnl = (best_bid - entry_price) * pos["size"] - est_fee
                 upnl_pct = unrealized_pct * 100
                 send(f"{reason}\n"
                      f"{'─'*28}\n"
                      f"📋 {pos['question'][:40]}\n"
                      f"進場: {entry_price:.3f} → 現價: {best_bid:.3f}\n"
-                     f"浮動 PnL: {unrealized_pnl:+.4f} USDC ({upnl_pct:+.2f}%)\n"
+                     f"淨浮動 PnL (含手續費): {net_unrealized_pnl:+.4f} USDC ({upnl_pct:+.2f}%)\n"
                      f"持倉時間: {int(hold_seconds)}s / {int(max_hold)}s\n"
                      f"TP: {tp_target:.3f} | SL: {sl_target:.3f}\n"
                      f"{'─'*28}")
-                _close_position(token_id)
-                _recently_closed[token_id] = time.time()
+                _close_position(token_id, reason, tp_target, sl_target)
+                # 只有當 _close_position 成功移除持倉後才設定冷卻
+                with _positions_lock:
+                    if token_id not in open_positions:
+                        _recently_closed[token_id] = time.time()
                 _clean_recently_closed()
     finally:
         _manage_lock.release()
@@ -449,30 +487,35 @@ def analyze_and_trade():
                 conf_multiplier = 1.5 if btc_info.get("high_conf") else 1.0
                 size = max(round(MAX_USD * conf_multiplier / best_ask, 2), min_size)
 
-                # ATR/ADX 自適應 TP/SL
-                tp_pct = 0.30
-                sl_pct = 0.15
+                # ATR/ADX 自適應 TP/SL (單位: 絕對價格漲跌幅百分比)
+                # 為了覆蓋約 3.12% 的雙向 Taker Fee，TP 最少必須大於手續費率 4% 以確保獲利
+                tp_pct = 0.08  # 預設 8% (+4.88% 淨利)
+                sl_pct = 0.10  # 預設 10% (-13.12% 淨損)
                 if btc_info["adx"] > 25:
-                    tp_pct = 0.45
+                    tp_pct = 0.12 # 趨勢強大時擴大獲利空間
                 if btc_info["close"] > 0 and btc_info["atr"] / btc_info["close"] > 0.0015:
-                    sl_pct = 0.25
-                    tp_pct = max(tp_pct, 0.40)
+                    sl_pct = 0.15 # 波動極大時延遲止損
+                    tp_pct = max(tp_pct, 0.15)
 
                 rr_ratio    = tp_pct / sl_pct
                 limit_price = round(
                     min(best_bid + spread * 0.5 * (1 + SLIPPAGE), best_ask), 3)
 
-                cost_usdc = size * limit_price
-                tp_price = entry_price + pos.get("entry_spread", spread) * tp_pct if False else limit_price + spread * tp_pct
+                # 包含 1.56% Taker fee 的建倉成本預估
+                fee_rate = 0.0156
+                cost_usdc = size * limit_price * (1 + fee_rate)
+                
+                tp_price = min(limit_price * (1 + tp_pct), 0.99)
                 sl_price = limit_price * (1 - sl_pct)
+                
                 send(f"💡 鎖定標的\n"
                      f"{'─'*28}\n"
                      f"📋 {q[:45]}\n"
                      f"方向: {dir_str} ({outcome_label})\n"
                      f"Bid: {best_bid:.3f} | Ask: {best_ask:.3f} | 價差: {spread:.4f}\n"
                      f"限價: {limit_price:.3f} | 數量: {size:.2f} 份\n"
-                     f"預估成本: ~{cost_usdc:.2f} USDC\n"
-                     f"TP: {tp_pct*100:.0f}% → ~{limit_price + spread * tp_pct:.3f}\n"
+                     f"預估成本(含手續費): ~{cost_usdc:.2f} USDC\n"
+                     f"TP: {tp_pct*100:.0f}% → ~{tp_price:.3f}\n"
                      f"SL: {sl_pct*100:.0f}% → ~{sl_price:.3f}\n"
                      f"R:R 比: {rr_ratio:.1f} | 剩餘: {int(time_left)}s\n"
                      f"{'─'*28}")
@@ -529,7 +572,7 @@ def analyze_and_trade():
                         "sl_pct":       sl_pct,
                     }
                 cost_usdc = real_size * fill_price
-                tp_target = fill_price + spread * tp_pct
+                tp_target = min(fill_price * (1 + tp_pct), 0.99)
                 sl_target_price = fill_price * (1 - sl_pct)
                 send(f"📥 建倉成功！\n"
                      f"{'─'*28}\n"

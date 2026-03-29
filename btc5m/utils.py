@@ -45,7 +45,7 @@ def _api_call_with_timeout(fn, *args, timeout=10, **kwargs):
 def log_trade(data: dict):
     """將交易紀錄追加寫入 CSV 日誌。"""
     FIELDS = ["date", "timestamp", "token_id", "side", "entry_price",
-              "exit_price", "size", "slippage_pct", "realized_pnl", "status"]
+              "exit_price", "size", "slippage_pct", "realized_pnl", "fees", "hold_time", "status"]
     file_exists = os.path.isfile(POSITION_FILE)
     with open(POSITION_FILE, mode="a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
