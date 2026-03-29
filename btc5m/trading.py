@@ -346,14 +346,30 @@ def manage_positions():
                 est_fee = entry_price * pos["size"] * fee_rate + best_bid * pos["size"] * fee_rate
                 net_unrealized_pnl = (best_bid - entry_price) * pos["size"] - est_fee
                 upnl_pct = unrealized_pct * 100
-                send(f"{reason}\n"
-                     f"{'─'*28}\n"
-                     f"📋 {pos['question'][:40]}\n"
-                     f"進場: {entry_price:.3f} → 現價: {best_bid:.3f}\n"
-                     f"淨浮動 PnL (含手續費): {net_unrealized_pnl:+.4f} USDC ({upnl_pct:+.2f}%)\n"
-                     f"持倉時間: {int(hold_seconds)}s / {int(max_hold)}s\n"
-                     f"TP: {tp_target:.3f} | SL: {sl_target:.3f}\n"
-                     f"{'─'*28}")
+
+                # 通知去重：同一原因只發一次 Telegram，避免結算延遲時刷屏
+                # 若原因「改變」（如從止盈跌入止損區），則重新發送
+                last_reason = pos.get("last_notified_reason")
+                last_notify_t = pos.get("last_notified_at", 0)
+                reason_changed = (last_reason != reason)
+                should_notify = reason_changed or (time.time() - last_notify_t > 120)
+
+                if should_notify:
+                    send(f"{reason}\n"
+                         f"{'─'*28}\n"
+                         f"📋 {pos['question'][:40]}\n"
+                         f"進場: {entry_price:.3f} → 現價: {best_bid:.3f}\n"
+                         f"淨浮動 PnL (含手續費): {net_unrealized_pnl:+.4f} USDC ({upnl_pct:+.2f}%)\n"
+                         f"持倉時間: {int(hold_seconds)}s / {int(max_hold)}s\n"
+                         f"TP: {tp_target:.3f} | SL: {sl_target:.3f}\n"
+                         f"{'─'*28}")
+                    with _positions_lock:
+                        if token_id in open_positions:
+                            open_positions[token_id]["last_notified_reason"] = reason
+                            open_positions[token_id]["last_notified_at"] = time.time()
+                else:
+                    print(f"🔕 [{reason}] 重試平倉中 ({int(hold_seconds)}s)，抑制重複通知")
+
                 _close_position(token_id, reason, tp_target, sl_target)
                 # 只有當 _close_position 成功移除持倉後才設定冷卻
                 with _positions_lock:
