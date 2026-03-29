@@ -98,6 +98,11 @@ _recently_closed: dict   = {}    # {token_id: 平倉時間戳}
 _consecutive_losses: int = 0
 _pause_until: float      = 0.0
 
+stats_signals_up: int    = 0
+stats_signals_down: int  = 0
+stats_orders_placed: int = 0
+
+_stats_lock              = threading.Lock()
 _pause_until_lock        = threading.Lock()
 _consecutive_losses_lock = threading.Lock()
 _manage_lock             = threading.Lock()

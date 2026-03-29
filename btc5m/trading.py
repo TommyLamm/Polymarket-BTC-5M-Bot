@@ -396,7 +396,9 @@ def analyze_and_trade():
         dir_str = "看漲 (買UP/YES)" if signal_dir == 1 else "看跌 (買DOWN/NO)"
         score = btc_info['bull_score'] if signal_dir == 1 else btc_info['bear_score']
         conf_tag = " 🔥高信心" if btc_info.get('high_conf') else ""
-        send(f"⚡ 捕捉到信號！{conf_tag}\n"
+        
+        # 不要立刻發送，先存成字串，確認有下單條件再發送
+        signal_msg = (f"⚡ 捕捉到信號！{conf_tag}\n"
              f"{'─'*28}\n"
              f"方向: {dir_str}\n"
              f"積分: 🐂{btc_info['bull_score']} / 🐻{btc_info['bear_score']}\n"
@@ -406,6 +408,14 @@ def analyze_and_trade():
              f"MACD: {'擴展✅' if btc_info['bull_exp'] or btc_info['bear_exp'] else '收斂❌'} | "
              f"放量: {'✅' if btc_info['vol_ok'] else '❌'}\n"
              f"{'─'*28}")
+
+        # 紀錄信號觸發次數（無論是否有效下單都先紀錄為「已捕獲」）
+        with cfg._stats_lock:
+            if signal_dir == 1:
+                cfg.stats_signals_up += 1
+            else:
+                cfg.stats_signals_down += 1
+
 
         # 透過 Series API 動態取得當前窗口子市場
         markets = fetch_active_btc5m_markets()
@@ -508,6 +518,10 @@ def analyze_and_trade():
                 tp_price = min(limit_price * (1 + tp_pct), 0.99)
                 sl_price = limit_price * (1 - sl_pct)
                 
+                if signal_msg:
+                    send(signal_msg)
+                    signal_msg = None  # 只發送一次，避免多個子市場重複發送信號訊息
+                
                 send(f"💡 鎖定標的\n"
                      f"{'─'*28}\n"
                      f"📋 {q[:45]}\n"
@@ -585,6 +599,10 @@ def analyze_and_trade():
                      f"最大持倉: {int(min(POS_MAX_HOLD_SEC, max(time_left - 30, 30)))}s | "
                      f"窗口剩餘: {int(time_left)}s\n"
                      f"{'─'*28}")
+                
+                with cfg._stats_lock:
+                    cfg.stats_orders_placed += 1
+                    
                 return
 
             except Exception as e:

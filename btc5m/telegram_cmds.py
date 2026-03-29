@@ -127,6 +127,11 @@ def cmd_status(message):
         pause = cfg._pause_until
     paused = now < pause
 
+    with cfg._stats_lock:
+        s_up = cfg.stats_signals_up
+        s_dn = cfg.stats_signals_down
+        s_ord = cfg.stats_orders_placed
+
     msg = (
         f"🤖 *Bot 狀態報告*\n"
         f"{'─'*28}\n"
@@ -135,6 +140,8 @@ def cmd_status(message):
         f"💰 今日 PnL: `{pnl_today:+.4f}` USDC\n"
         f"📈 資本基準: `{START_CAPITAL}` USDC\n"
         f"🛡️ 熔斷狀態: `{'❌ 暫停中 (剩餘 ' + str(int(pause - now)) + 's)' if paused else '✅ 正常運行'}`\n"
+        f"📡 捕獲信號: 🐂 `{s_up}` 次 / 🐻 `{s_dn}` 次\n"
+        f"🎯 有效下單: `{s_ord}` 次\n"
         f"{'─'*28}"
     )
     BOT.reply_to(message, msg, parse_mode="Markdown")
