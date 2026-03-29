@@ -74,8 +74,8 @@ client = _init_client()
 # 📊  全局交易參數
 # ======================================================
 MAX_USD           = 2      # 每次最大下單金額 (USDC)
-DAILY_MAX_LOSS    = 0.5    # 單日最大損失比例 (5%)
-DAILY_TAKE_PROFIT = 0.5    # 單日止盈比例 (5%)
+DAILY_MAX_LOSS    = 0.5    # 單日最大損失比例 (50%)
+DAILY_TAKE_PROFIT = 0.5    # 單日止盈比例 (50%)
 SLIPPAGE          = 0.015   # 最大容許滑點 (1.5%)
 ORDER_TIMEOUT     = 10      # 訂單輪詢超時秒數
 MIN_SPREAD        = 0.015   # 最小有效買賣價差
