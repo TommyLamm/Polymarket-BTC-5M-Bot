@@ -11,11 +11,25 @@ PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY")
 FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS")
 SIGNATURE_TYPE = os.getenv("SIGNATURE_TYPE", "2")
 
-# 連接到 Polygon RPC
-RPC_URL = "https://polygon-rpc.com"
-w3 = Web3(Web3.HTTPProvider(RPC_URL))
+# 嘗試多個 Polygon RPC
+RPC_URLS = [
+    "https://polygon.llamarpc.com",
+    "https://rpc.ankr.com/polygon",
+    "https://1rpc.io/matic",
+    "https://polygon-rpc.com",
+    "https://rpc-mainnet.maticvigil.com"
+]
 
-# Polymarket 使用的 USDC.e 代幣合約地址 (Polygon)
+w3 = None
+for rpc in RPC_URLS:
+    temp_w3 = Web3(Web3.HTTPProvider(rpc))
+    if temp_w3.is_connected():
+        w3 = temp_w3
+        # print(f"🔗 成功連接到 RPC: {rpc}")
+        break
+
+if not w3 or not w3.is_connected():
+    print("❌ 所有 Polygon RPC 都無法連線，請稍後再試或檢查網路")
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 
 # ERC20 ABI (只需要 balanceOf)
