@@ -23,7 +23,7 @@ from btc5m.config import (
 from btc5m.utils import (
     send, _api_call_with_timeout, log_trade,
     get_daily_realized_pnl, _parse_orderbook,
-    _get_order_id, _clean_recently_closed,
+    _get_order_id, _clean_recently_closed, get_usdc_balance,
 )
 from btc5m.market import fetch_active_btc5m_markets, _resolve_token_id
 from btc5m.signals import get_btc_signals
@@ -296,9 +296,17 @@ def manage_positions():
                 print(f"📊 持倉監控 - 訂單簿查詢失敗: {e} | token={token_id[:12]}…")
                 # 如果持倉超過 5 分鐘且訂單簿無法查詢，市場可能已結算
                 if hold_seconds > 330:
+                    from btc5m.utils import get_usdc_balance
+                    settle_bal = get_usdc_balance()
+                    bal_str = f"{settle_bal:.4f} USDC" if settle_bal >= 0 else "查詢失敗"
+                    # 取得市場方算时間段標識
+                    mkt_end_dt = pos.get('opened_at') + datetime.timedelta(seconds=pos.get('time_left', 0))
+                    mkt_label  = mkt_end_dt.strftime('%H:%M') + ' UTC'
                     send(f"🏁 市場已結算（訂單簿查詢失敗）\n"
                          f"📋 {pos.get('question', 'N/A')[:40]}\n"
+                         f"市場結束: {mkt_label}\n"
                          f"持倉時間: {int(hold_seconds)}s\n"
+                         f"💰 結算後餘額: {bal_str}\n"
                          f"自動清除持倉記錄")
                     with _positions_lock:
                         open_positions.pop(token_id, None)
@@ -307,10 +315,17 @@ def manage_positions():
             if best_bid is None:
                 # 訂單簿為空，可能市場已結算
                 if hold_seconds > 330:
+                    from btc5m.utils import get_usdc_balance
+                    settle_bal = get_usdc_balance()
+                    bal_str = f"{settle_bal:.4f} USDC" if settle_bal >= 0 else "查詢失敗"
+                    mkt_end_dt = pos.get('opened_at') + datetime.timedelta(seconds=pos.get('time_left', 0))
+                    mkt_label  = mkt_end_dt.strftime('%H:%M') + ' UTC'
                     send(f"🏁 市場已結算（訂單簿為空）\n"
                          f"📋 {pos.get('question', 'N/A')[:40]}\n"
+                         f"市場結束: {mkt_label}\n"
                          f"進場: {entry_price:.3f} | 數量: {pos['size']:.2f}\n"
                          f"持倉時間: {int(hold_seconds)}s\n"
+                         f"💰 結算後餘額: {bal_str}\n"
                          f"自動清除持倉記錄，請到 Polymarket 領取結算獎金")
                     with _positions_lock:
                         open_positions.pop(token_id, None)
@@ -323,7 +338,7 @@ def manage_positions():
             if tp_target <= entry_price:
                 tp_target = entry_price + 0.01 # 防呆機制，確保有獲利空間
                 
-            sl_target = entry_price * (1 - pos["sl_pct"])
+            sl_target = entry_price * (1 - sl_pct)
 
             unrealized_pct = (best_bid - entry_price) / entry_price
             if unrealized_pct > 0.05:
@@ -558,17 +573,24 @@ def analyze_and_trade():
                     send(signal_msg)
                     signal_msg = None  # 只發送一次，避免多個子市場重複發送信號訊息
                 
+                # 下單前查詢餘額
+                pre_bal = get_usdc_balance()
+                with cfg._balance_lock:
+                    cfg._pre_order_balance = pre_bal
+                pre_bal_str = f"{pre_bal:.4f} USDC" if pre_bal >= 0 else "查詢失敗"
+
                 send(f"💡 鎖定標的\n"
-                     f"{'─'*28}\n"
+                     f"{'\u2500'*28}\n"
                      f"📋 {q[:45]}\n"
                      f"方向: {dir_str} ({outcome_label})\n"
+                     f"💰 下單前餘額: {pre_bal_str}\n"
                      f"Bid: {best_bid:.3f} | Ask: {best_ask:.3f} | 價差: {spread:.4f}\n"
                      f"限價: {limit_price:.3f} | 數量: {size:.2f} 份\n"
                      f"預估成本(含手續費): ~{cost_usdc:.2f} USDC\n"
                      f"TP: {tp_pct*100:.0f}% → ~{tp_price:.3f}\n"
                      f"SL: {sl_pct*100:.0f}% → ~{sl_price:.3f}\n"
                      f"R:R 比: {rr_ratio:.1f} | 剩餘: {int(time_left)}s\n"
-                     f"{'─'*28}")
+                     f"{'\u2500'*28}")
 
                 order_args   = OrderArgs(price=limit_price, size=size,
                                          side=BUY, token_id=target_token_id)
@@ -605,6 +627,11 @@ def analyze_and_trade():
                 send("⏳ 等待鏈上結算 (10s)...")
                 time.sleep(10)  # 等待 Polygon 鏈上結算完成
 
+                # 下單後 10s 查詢餘額，追蹤餘額變化
+                post_bal = get_usdc_balance()
+                with cfg._balance_lock:
+                    cfg._post_order_balance = post_bal
+
                 # 使用 size_matched（訂單自身的成交量），比 get_trades 更可靠
                 real_size = size_matched if size_matched > 0.001 else size
                 if size_matched < 0.001:
@@ -624,6 +651,18 @@ def analyze_and_trade():
                 cost_usdc = real_size * fill_price
                 tp_target = min(fill_price * (1 + tp_pct), 0.99)
                 sl_target_price = fill_price * (1 - sl_pct)
+
+                # 餘額變化計算
+                with cfg._balance_lock:
+                    pre_b  = cfg._pre_order_balance
+                    post_b = cfg._post_order_balance
+                if pre_b >= 0 and post_b >= 0:
+                    bal_delta_str = f"\n💰 餘額變化: {pre_b:.4f} → {post_b:.4f} USDC ({post_b - pre_b:+.4f})"
+                elif post_b >= 0:
+                    bal_delta_str = f"\n💰 下單後餘額: {post_b:.4f} USDC"
+                else:
+                    bal_delta_str = ""
+
                 send(f"📥 建倉成功！\n"
                      f"{'─'*28}\n"
                      f"📋 {q[:45]}\n"
@@ -631,10 +670,11 @@ def analyze_and_trade():
                      f"成交: {real_size:.2f} 份 @ {fill_price:.3f}\n"
                      f"成本: ~{cost_usdc:.2f} USDC\n"
                      f"TP: {tp_target:.3f} ({tp_pct*100:.0f}%)\n"
-                     f"SL: {sl_target_price:.3f} ({sl_pct*100:.0f}%)\n"
+                     f"SL: {sl_target_price:.3f} ({sl_pct*100:.0f}%){bal_delta_str}\n"
                      f"最大持倉: {int(min(POS_MAX_HOLD_SEC, max(time_left - 30, 30)))}s | "
                      f"窗口剩餘: {int(time_left)}s\n"
                      f"{'─'*28}")
+
                 
                 with cfg._stats_lock:
                     cfg.stats_orders_placed += 1
