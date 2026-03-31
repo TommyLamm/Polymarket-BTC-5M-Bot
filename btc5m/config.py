@@ -109,8 +109,13 @@ _manage_lock             = threading.Lock()
 _analyze_lock            = threading.Lock()
 _positions_lock          = threading.Lock()
 _send_lock               = threading.Lock()
+_balance_lock            = threading.Lock()    # 餘額查詢鎖
 
 open_positions: dict = {}  # {token_id: 持倉資訊 dict}
+
+# 餘額追蹤
+_pre_order_balance:  float = -1.0  # 上次下單前餘額
+_post_order_balance: float = -1.0  # 上次下單後 10s 餘額
 
 _SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 POSITION_FILE = os.path.join(os.path.dirname(_SCRIPT_DIR), "trades_log.csv")

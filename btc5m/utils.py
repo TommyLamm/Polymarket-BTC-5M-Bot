@@ -10,10 +10,11 @@ import threading
 import concurrent.futures
 
 import pandas as pd
+from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
 
 from btc5m.config import (
     BOT, CHAT_ID, POSITION_FILE, COOLDOWN_SEC,
-    _send_lock, _recently_closed, _API_EXECUTOR,
+    _send_lock, _recently_closed, _API_EXECUTOR, client,
 )
 
 
@@ -95,3 +96,21 @@ def _get_order_id(resp) -> str | None:
     if isinstance(resp, dict):
         return resp.get("orderID") or resp.get("id")
     return None
+
+
+def get_usdc_balance() -> float:
+    """
+    通過 Polymarket CLOB API 查詢 USDC 餘額（使用 API 憑證，無需 RPC）。
+    返回 USDC 金額（浮點數），失敗時返回 -1.0。
+
+    速率限制：200次/10秒 → 每10秒查一次絕對安全。
+    """
+    try:
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        resp = _api_call_with_timeout(client.get_balance_allowance, params)
+        # balance 單位是 wei（USDC 6位小數），轉換為 USDC
+        balance_wei = int(resp.get("balance", 0))
+        return balance_wei / 1_000_000
+    except Exception as e:
+        print(f"⚠️ 查詢 USDC 餘額失敗: {e}")
+        return -1.0

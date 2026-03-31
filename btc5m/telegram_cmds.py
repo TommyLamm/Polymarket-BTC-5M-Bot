@@ -11,7 +11,7 @@ from btc5m.config import (
     open_positions, _positions_lock,
     MAX_POSITIONS, POS_MAX_HOLD_SEC, START_CAPITAL,
 )
-from btc5m.utils import _api_call_with_timeout, _parse_orderbook, get_daily_realized_pnl
+from btc5m.utils import _api_call_with_timeout, _parse_orderbook, get_daily_realized_pnl, get_usdc_balance
 from btc5m.trading import _close_position
 
 
@@ -132,17 +132,41 @@ def cmd_status(message):
         s_dn = cfg.stats_signals_down
         s_ord = cfg.stats_orders_placed
 
+    # 即時查詢餘額
+    live_bal = get_usdc_balance()
+    live_bal_str = f"`{live_bal:.4f}` USDC" if live_bal >= 0 else "`查詢失敗`"
+
+    # 上次下單前後餘額
+    with cfg._balance_lock:
+        pre_b  = cfg._pre_order_balance
+        post_b = cfg._post_order_balance
+
+    if pre_b >= 0:
+        pre_bal_str = f"`{pre_b:.4f}` USDC"
+    else:
+        pre_bal_str = "`尚未記錄`"
+
+    if post_b >= 0:
+        delta = post_b - pre_b if pre_b >= 0 else 0
+        post_bal_str = f"`{post_b:.4f}` USDC (`{delta:+.4f}`)"
+    else:
+        post_bal_str = "`尚未記錄`"
+
     msg = (
         f"🤖 *Bot 狀態報告*\n"
-        f"{'─'*28}\n"
+        f"{'\u2500'*28}\n"
         f"⏰ {datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')} HKT\n"
         f"📊 持倉: `{pos_count}/{MAX_POSITIONS}`\n"
-        f"💰 今日 PnL: `{pnl_today:+.4f}` USDC\n"
-        f"📈 資本基準: `{START_CAPITAL}` USDC\n"
-        f"🛡️ 熔斷狀態: `{'❌ 暫停中 (剩餘 ' + str(int(pause - now)) + 's)' if paused else '✅ 正常運行'}`\n"
+        f"💰 即時餘額: {live_bal_str}\n"
+        f"📈 今日 PnL: `{pnl_today:+.4f}` USDC\n"
+        f"📊 資本基準: `{cfg.START_CAPITAL:.4f}` USDC\n"
+        f"🛡️ 燔斷狀態: `{'\u274c 暫停中 (剩餘 ' + str(int(pause - now)) + 's)' if paused else '\u2705 正常運行'}`\n"
         f"📡 捕獲信號: 🐂 `{s_up}` 次 / 🐻 `{s_dn}` 次\n"
         f"🎯 有效下單: `{s_ord}` 次\n"
-        f"{'─'*28}"
+        f"{'\u2500'*28}\n"
+        f"💳 上次下單前餘額: {pre_bal_str}\n"
+        f"💳 下單後餘額(10s): {post_bal_str}\n"
+        f"{'\u2500'*28}"
     )
     BOT.reply_to(message, msg, parse_mode="Markdown")
 
