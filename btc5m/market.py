@@ -92,8 +92,8 @@ def fetch_active_btc5m_markets() -> list[dict]:
                     _cfg._market_cache_ts = now_ts
                     print(f"✅ [slug 備援] {slug} | {len(markets)} 個子市場")
                     return markets
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ slug 備援查詢失敗 ({slug}): {e}")
 
     send("🚨 所有市場查詢方案均失敗，請確認 BTC5M_SERIES_ID 是否仍有效")
     return []

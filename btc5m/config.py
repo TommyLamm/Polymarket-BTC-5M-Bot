@@ -23,13 +23,23 @@ def _require_env(key: str) -> str:
     return val
 
 
+def _parse_signature_type(raw: str) -> int:
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError) as e:
+        raise EnvironmentError("❌ SIGNATURE_TYPE 必須是 0、1 或 2") from e
+    if parsed not in (0, 1, 2):
+        raise EnvironmentError("❌ SIGNATURE_TYPE 只能是 0、1 或 2")
+    return parsed
+
+
 BOT_TOKEN = _require_env("TELEGRAM_BOT_TOKEN")
 CHAT_ID = _require_env("TELEGRAM_CHAT_ID")
 PRIVATE_KEY = _require_env("WALLET_PRIVATE_KEY")
 # FUNDER_ADDRESS：在 polymarket.com/settings 頁面顯示的代理錢包地址
 FUNDER_ADDRESS = _require_env("FUNDER_ADDRESS")
 # SIGNATURE_TYPE：0=EOA 標準錢包 | 1=POLY_PROXY 魔法連結 | 2=GNOSIS_SAFE（最常見）
-SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "2"))
+SIGNATURE_TYPE = _parse_signature_type(os.getenv("SIGNATURE_TYPE", "2"))
 
 BOT = telebot.TeleBot(BOT_TOKEN)
 

@@ -5,14 +5,27 @@ from py_clob_client.client import ClobClient
 load_dotenv()
 PK = os.getenv("WALLET_PRIVATE_KEY")
 FUNDER = os.getenv("FUNDER_ADDRESS")
+SIGNATURE_TYPE = int(os.getenv("SIGNATURE_TYPE", "2"))
 
-# 初始化 Client
-client = ClobClient(
+if not PK or not FUNDER:
+    raise EnvironmentError("❌ 請先設定 WALLET_PRIVATE_KEY 與 FUNDER_ADDRESS")
+
+# 初始化 Client（L1 取得或推導 API 憑證 → L2 查詢訂單）
+bootstrap = ClobClient(
     host="https://clob.polymarket.com",
     chain_id=137,
     key=PK,
     funder=FUNDER,
-    signature_type=2,
+    signature_type=SIGNATURE_TYPE,
+)
+creds = bootstrap.create_or_derive_api_creds()
+client = ClobClient(
+    host="https://clob.polymarket.com",
+    chain_id=137,
+    key=PK,
+    creds=creds,
+    funder=FUNDER,
+    signature_type=SIGNATURE_TYPE,
 )
 
 def check_order(order_id):

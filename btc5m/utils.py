@@ -10,10 +10,11 @@ import threading
 import concurrent.futures
 
 import pandas as pd
+import requests
 from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
 
 from btc5m.config import (
-    BOT, CHAT_ID, POSITION_FILE, COOLDOWN_SEC,
+    BOT, CHAT_ID, FUNDER_ADDRESS, POSITION_FILE, COOLDOWN_SEC,
     _send_lock, _recently_closed, _API_EXECUTOR, client,
 )
 
@@ -29,8 +30,8 @@ def send(msg: str):
         with _send_lock:
             try:
                 BOT.send_message(CHAT_ID, str(msg), timeout=15)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️ Telegram 發送失敗: {e}")
     threading.Thread(target=_tg, daemon=True).start()
 
 
@@ -63,7 +64,8 @@ def get_daily_realized_pnl() -> float:
         df = pd.read_csv(POSITION_FILE)
         today = datetime.date.today().isoformat()
         return float(df[df["date"] == today]["realized_pnl"].sum())
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ 讀取交易日誌失敗: {e}")
         return 0.0
 
 
@@ -114,3 +116,63 @@ def get_usdc_balance() -> float:
     except Exception as e:
         print(f"⚠️ 查詢 USDC 餘額失敗: {e}")
         return -1.0
+
+
+def get_conditional_token_balance(token_id: str) -> float:
+    """
+    查詢指定 outcome token 的可用餘額（份數）。
+    失敗時回傳 -1.0。
+    """
+    try:
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.CONDITIONAL,
+            token_id=str(token_id),
+        )
+        resp = _api_call_with_timeout(client.get_balance_allowance, params)
+        balance_raw = int(resp.get("balance", 0))
+        # CLOB 返回 1e6 精度
+        return balance_raw / 1_000_000
+    except Exception as e:
+        print(f"⚠️ 查詢條件代幣餘額失敗 ({str(token_id)[:12]}…): {e}")
+        return -1.0
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def fetch_live_positions(timeout: int = 8) -> dict[str, dict] | None:
+    """
+    從 Data API 取得目前持倉（未平倉）快照，key 為 token_id(asset)。
+    失敗時回傳 None，呼叫端可決定是否降級處理。
+    """
+    try:
+        resp = requests.get(
+            "https://data-api.polymarket.com/positions",
+            params={"user": FUNDER_ADDRESS},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, list):
+            print(f"⚠️ Data API positions 回應格式異常: {type(payload)}")
+            return {}
+
+        out: dict[str, dict] = {}
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            token_id = str(row.get("asset") or "").strip()
+            if not token_id:
+                continue
+            normalized = dict(row)
+            normalized["size"] = _safe_float(row.get("size"), 0.0)
+            normalized["redeemable"] = bool(row.get("redeemable", False))
+            out[token_id] = normalized
+        return out
+    except Exception as e:
+        print(f"⚠️ 查詢 Data API 持倉失敗: {e}")
+        return None

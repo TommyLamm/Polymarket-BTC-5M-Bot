@@ -54,9 +54,10 @@ def check_wallet():
 
     print(f"🏦 指定的 FUNDER_ADDRESS (代理錢包/目標地址): {FUNDER_ADDRESS}")
     print(f"📝 目前的 SIGNATURE_TYPE: {SIGNATURE_TYPE}")
-    print(f"🌐 Polygon RPC 連線狀態: {'🟢 成功' if w3.is_connected() else '🔴 失敗'}\n")
+    rpc_ok = bool(w3 and w3.is_connected())
+    print(f"🌐 Polygon RPC 連線狀態: {'🟢 成功' if rpc_ok else '🔴 失敗'}\n")
 
-    if not w3.is_connected():
+    if not rpc_ok:
         return
 
     usdc_contract = w3.eth.contract(address=w3.to_checksum_address(USDC_ADDRESS), abi=ERC20_ABI)
