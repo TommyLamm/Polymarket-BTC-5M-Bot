@@ -11,8 +11,15 @@ from btc5m.config import (
     open_positions, _positions_lock,
     MAX_POSITIONS, POS_MAX_HOLD_SEC, START_CAPITAL,
 )
-from btc5m.utils import _api_call_with_timeout, _parse_orderbook, get_daily_realized_pnl, get_usdc_balance
+from btc5m.utils import (
+    _api_call_with_timeout,
+    _parse_orderbook,
+    get_daily_realized_pnl,
+    get_usdc_balance,
+    extract_list_payload,
+)
 from btc5m.trading import _close_position
+from btc5m.observability import record_position_event, summarize_missed_trades
 
 
 # ======================================================
@@ -29,9 +36,47 @@ def cmd_close_all(message):
         BOT.reply_to(message, "📭 目前沒有持倉")
         return
     BOT.reply_to(message, f"🔄 開始清倉 {len(tokens)} 個部位...")
+    outcomes = []
     for token_id in tokens:
         _close_position(token_id)
-    BOT.reply_to(message, "✅ 全部清倉完成")
+        with _positions_lock:
+            cur = open_positions.get(token_id)
+        if cur is None:
+            outcomes.append((token_id, "closed"))
+            continue
+        if cur.get("exit_state") == "dust_pending_settlement":
+            outcomes.append((token_id, "dust_pending"))
+        else:
+            outcomes.append((token_id, "still_open"))
+
+    closed = sum(1 for _, s in outcomes if s == "closed")
+    dust = sum(1 for _, s in outcomes if s == "dust_pending")
+    still_open = sum(1 for _, s in outcomes if s == "still_open")
+
+    if dust > 0 or still_open > 0:
+        lines = [
+            "⚠️ 清倉部分完成",
+            f"已平倉: {closed}",
+            f"dust待結算: {dust}",
+            f"仍未平倉: {still_open}",
+        ]
+        for tid, status in outcomes:
+            status_label = (
+                "✅ 已平倉" if status == "closed"
+                else "🟡 dust待結算" if status == "dust_pending"
+                else "❌ 仍未平倉"
+            )
+            lines.append(f"• {tid[:12]}… {status_label}")
+        BOT.reply_to(message, "\n".join(lines))
+        record_position_event(
+            "close_all_partial",
+            message="close_all completed with unresolved positions",
+            closed=closed,
+            dust_pending=dust,
+            still_open=still_open,
+        )
+    else:
+        BOT.reply_to(message, f"✅ 全部清倉完成（{closed}/{len(tokens)}）")
 
 
 @BOT.message_handler(commands=["positions"])
@@ -84,9 +129,12 @@ def cmd_positions(message):
 
     # 再顯示鏈上成交統計
     try:
-        trades = _api_call_with_timeout(client.get_trades)
+        trades_resp = _api_call_with_timeout(client.get_trades)
+        trades = extract_list_payload(trades_resp, keys=("data", "results", "items", "trades"))
         chain_positions = {}
         for t in trades:
+            if not isinstance(t, dict):
+                continue
             # 檢查 maker 和 taker 兩邊（吃單方=taker）
             maker = str(t.get("maker") or t.get("maker_address") or "").lower()
             taker = str(t.get("taker") or t.get("taker_address") or "").lower()
@@ -161,7 +209,7 @@ def cmd_status(message):
         f"💰 即時餘額: {live_bal_str}\n"
         f"📈 今日 PnL: `{pnl_today:+.4f}` USDC\n"
         f"📊 資本基準: `{cfg.START_CAPITAL:.4f}` USDC\n"
-        f"🛡️ 燔斷狀態: `{'\u274c 暫停中 (剩餘 ' + str(int(pause - now)) + 's)' if paused else '\u2705 正常運行'}`\n"
+        f"🛡️ 熔斷狀態: `{'\u274c 暫停中 (剩餘 ' + str(int(pause - now)) + 's)' if paused else '\u2705 正常運行'}`\n"
         f"📡 捕獲信號: 🐂 `{s_up}` 次 / 🐻 `{s_dn}` 次\n"
         f"🎯 有效下單: `{s_ord}` 次\n"
         f"{'\u2500'*28}\n"

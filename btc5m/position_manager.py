@@ -18,7 +18,7 @@ from btc5m.utils import (
     get_usdc_balance, get_conditional_token_balance,
 )
 from btc5m.trade_exit import _close_position
-from btc5m.observability import record_api_error
+from btc5m.observability import record_api_error, record_position_event
 
 
 def _reconcile_settlement_state(token_id: str, pos: dict, hold_seconds: float, source: str) -> bool:
@@ -40,6 +40,16 @@ def _reconcile_settlement_state(token_id: str, pos: dict, hold_seconds: float, s
         bal_str = f"{settle_bal:.4f} USDC" if settle_bal >= 0 else "查詢失敗"
         mkt_end_dt = pos.get("opened_at") + datetime.timedelta(seconds=pos.get("time_left", 0))
         mkt_label = mkt_end_dt.strftime("%H:%M") + " UTC"
+        record_position_event(
+            "settlement_redeemable_cleared",
+            message="position manager reconcile cleared redeemable position",
+            token_id=token_id,
+            source=source,
+            hold_seconds=hold_seconds,
+            live_size=live_size,
+            balance_size=bal_size,
+            decision_reason="redeemable_true",
+        )
         send(
             f"🏁 市場已結算（可領取）\n"
             f"📋 {pos.get('question', 'N/A')[:40]}\n"
@@ -54,6 +64,16 @@ def _reconcile_settlement_state(token_id: str, pos: dict, hold_seconds: float, s
         return True
 
     if row is None and bal_size <= 0.0001:
+        record_position_event(
+            "settlement_reconciled_closed",
+            message="position manager reconcile removed local position",
+            token_id=token_id,
+            source=source,
+            hold_seconds=hold_seconds,
+            live_size=live_size,
+            balance_size=bal_size,
+            decision_reason="row_missing_and_balance_zero",
+        )
         send(
             f"✅ 對賬確認：鏈上已無持倉，清除本地追蹤\n"
             f"📋 {pos.get('question', 'N/A')[:40]}\n"
@@ -78,6 +98,26 @@ def _reconcile_settlement_state(token_id: str, pos: dict, hold_seconds: float, s
             open_positions[token_id]["last_settle_notice_at"] = now_ts
 
     if should_notice:
+        if source in {"訂單簿查詢失敗", "訂單簿為空", "市場結束超時", "dust 殘量待結算"}:
+            record_position_event(
+                "settlement_no_orderbook",
+                message="settlement reconcile notice",
+                token_id=token_id,
+                source=source,
+                hold_seconds=hold_seconds,
+                live_size=live_size,
+                balance_size=bal_size,
+            )
+        record_position_event(
+            "settlement_reconcile_pending",
+            message="position manager reconcile pending",
+            token_id=token_id,
+            source=source,
+            hold_seconds=hold_seconds,
+            live_size=live_size,
+            balance_size=bal_size,
+            decision_reason="position_still_exists",
+        )
         send(
             f"⚠️ 結算對賬：仍有未清持倉，繼續監控重試\n"
             f"📋 {pos.get('question', 'N/A')[:40]}\n"
@@ -104,8 +144,59 @@ def manage_positions():
 
         now_dt = datetime.datetime.now(datetime.timezone.utc)
         for token_id, pos in tokens:
-            entry_price = pos["entry_price"]
             hold_seconds = (now_dt - pos["opened_at"]).total_seconds()
+            if pos.get("exit_state") == "dust_pending_settlement":
+                reconciled = _reconcile_settlement_state(
+                    token_id, pos, hold_seconds, source="dust 殘量待結算"
+                )
+                with _positions_lock:
+                    latest = open_positions.get(token_id)
+                    dust_min_size = float((latest or {}).get("dust_min_order_size", 0.0) or 0.0)
+                    latest_size = float((latest or {}).get("size", 0.0) or 0.0)
+                if latest is not None and dust_min_size > 0 and latest_size + 1e-9 >= dust_min_size:
+                    with _positions_lock:
+                        cur = open_positions.get(token_id)
+                        if cur is None:
+                            continue
+                        cur.pop("exit_state", None)
+                        cur.pop("exit_state_reason", None)
+                        cur.pop("dust_notified_at", None)
+                        cur.pop("dust_poll_logged_at", None)
+                        recovered_pos = cur.copy()
+                    send(
+                        f"✅ dust 持倉恢復可交易，重新啟動平倉邏輯\n"
+                        f"Token: {token_id[:12]}… | size: {latest_size:.4f}"
+                    )
+                    record_position_event(
+                        "dust_recovered_tradeable",
+                        message="dust position recovered and can trade again",
+                        token_id=token_id,
+                        hold_seconds=hold_seconds,
+                        recovered_size=latest_size,
+                        min_order_size=dust_min_size,
+                        source="position_manager",
+                    )
+                    pos = recovered_pos
+                if not reconciled:
+                    with _positions_lock:
+                        cur = open_positions.get(token_id, {})
+                        last_log_ts = float(cur.get("dust_poll_logged_at", 0.0) or 0.0)
+                        now_ts = time.time()
+                        should_log = (now_ts - last_log_ts) >= 120
+                        if should_log and token_id in open_positions:
+                            open_positions[token_id]["dust_poll_logged_at"] = now_ts
+                    if should_log:
+                        record_position_event(
+                            "exit_dust_below_min_size",
+                            message="position manager polling dust settlement",
+                            token_id=token_id,
+                            hold_seconds=hold_seconds,
+                            source="position_manager",
+                        )
+                if pos.get("exit_state") == "dust_pending_settlement":
+                    continue
+
+            entry_price = pos["entry_price"]
 
             time_since_market_end = hold_seconds - pos["time_left"]
             if time_since_market_end > 180:
@@ -126,6 +217,13 @@ def manage_positions():
                     token_id=token_id,
                     hold_seconds=hold_seconds,
                 )
+                if "no orderbook exists for the requested token id" in str(e).lower():
+                    record_position_event(
+                        "settlement_no_orderbook",
+                        message="position manager get_order_book no orderbook",
+                        token_id=token_id,
+                        hold_seconds=hold_seconds,
+                    )
                 if hold_seconds > 330:
                     reconciled = _reconcile_settlement_state(
                         token_id, pos, hold_seconds, source="訂單簿查詢失敗"

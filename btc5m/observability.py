@@ -42,6 +42,16 @@ MISSED_REASON_LABELS: dict[str, str] = {
     "missing_order_id": "送單回應缺少訂單 ID",
 }
 
+POSITION_EVENT_LABELS: dict[str, str] = {
+    "exit_dust_below_min_size": "可賣殘量低於最小下單量",
+    "settlement_no_orderbook": "市場無可用訂單簿（可能已結算）",
+    "close_all_partial": "/close_all 部分完成",
+    "settlement_reconciled_closed": "對賬確認持倉已清空",
+    "settlement_redeemable_cleared": "對賬確認可領取，已清除本地持倉",
+    "settlement_reconcile_pending": "對賬後仍有持倉，持續監控",
+    "dust_recovered_tradeable": "dust 持倉恢復可交易",
+}
+
 
 def _iso_now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -167,6 +177,16 @@ def record_order_result(
         order_id=order_id or "",
         error_text=error_text,
         error_kind=error_kind,
+        **fields,
+    )
+
+
+def record_position_event(event_code: str, message: str = "", **fields) -> dict[str, Any]:
+    return log_event(
+        "position_event",
+        event_code=event_code,
+        event_label=POSITION_EVENT_LABELS.get(event_code, event_code),
+        message=message,
         **fields,
     )
 

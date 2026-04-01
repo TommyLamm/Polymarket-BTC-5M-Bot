@@ -6,6 +6,7 @@ import os
 import csv
 import time
 import datetime
+import random
 import threading
 import concurrent.futures
 
@@ -24,6 +25,39 @@ from btc5m.observability import log_event, record_api_error, record_rpc_warning
 # 🛠️  通用工具函數
 # ======================================================
 
+_RETRYABLE_READ_FUNCS = {
+    "get_order_book",
+    "get_order",
+    "get_trades",
+    "get_balance_allowance",
+}
+_WRITE_FUNCS = {"create_order", "post_order", "cancel"}
+
+
+def _should_retry_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    terminal_markers = (
+        "no orderbook exists for the requested token id",
+        "order not found",
+        "not found",
+    )
+    if any(marker in text for marker in terminal_markers):
+        return False
+    retry_markers = (
+        "429",
+        "rate limit",
+        "too many requests",
+        "timeout",
+        "timed out",
+        "connection",
+        "temporarily unavailable",
+        "503",
+        "502",
+        "504",
+        "500",
+    )
+    return any(marker in text for marker in retry_markers)
+
 def send(msg: str):
     """同時輸出至 console 與 Telegram（非阻塞）。"""
     print(msg)
@@ -36,59 +70,181 @@ def send(msg: str):
     threading.Thread(target=_tg, daemon=True).start()
 
 
-def _api_call_with_timeout(fn, *args, timeout=10, **kwargs):
-    """在共享執行緒池中以超時方式執行 API 呼叫。"""
-    started_at = time.time()
+def _api_call_with_timeout(fn, *args, timeout=10, retries: int | None = None, **kwargs):
+    """在共享執行緒池中以超時方式執行 API 呼叫（含讀取端點重試）。"""
     fn_name = getattr(fn, "__name__", str(fn))
-    future = _API_EXECUTOR.submit(fn, *args, **kwargs)
-    try:
-        result = future.result(timeout=timeout)
-        latency_ms = round((time.time() - started_at) * 1000, 2)
-        log_event(
-            "api_call",
-            api_name=fn_name,
-            latency_ms=latency_ms,
-            timeout_sec=timeout,
-            ok=True,
-        )
-        if fn_name == "post_order" and latency_ms >= 2500:
-            warning_msg = f"下單廣播延遲：post_order 耗時 {latency_ms} ms"
-            print(f"⚠️ {warning_msg}")
-            record_rpc_warning(
-                "order_broadcast_delay",
-                warning_msg,
-                source=fn_name,
+    if retries is None:
+        retries = 2 if fn_name in _RETRYABLE_READ_FUNCS else 0
+        if fn_name in _WRITE_FUNCS:
+            retries = 0
+    retries = max(int(retries), 0)
+
+    for attempt in range(retries + 1):
+        started_at = time.time()
+        future = _API_EXECUTOR.submit(fn, *args, **kwargs)
+        try:
+            result = future.result(timeout=timeout)
+            latency_ms = round((time.time() - started_at) * 1000, 2)
+            log_event(
+                "api_call",
+                api_name=fn_name,
                 latency_ms=latency_ms,
+                timeout_sec=timeout,
+                ok=True,
+                attempt=attempt + 1,
             )
-        return result
-    except concurrent.futures.TimeoutError as e:
-        latency_ms = round((time.time() - started_at) * 1000, 2)
-        error_msg = f"API 呼叫 {fn_name} 逾時 ({timeout}s)"
-        record_api_error(
-            fn_name,
-            error_msg,
-            latency_ms=latency_ms,
-            timeout_sec=timeout,
-        )
-        if fn_name in {"get_balance_allowance", "get_order", "get_order_book"}:
-            warning_msg = f"獲取合約數據逾時：{fn_name}（{timeout}s）"
-            print(f"⚠️ {warning_msg}")
-            record_rpc_warning(
-                "contract_data_timeout",
-                warning_msg,
-                source=fn_name,
+            if fn_name == "post_order" and latency_ms >= 2500:
+                warning_msg = f"下單廣播延遲：post_order 耗時 {latency_ms} ms"
+                print(f"⚠️ {warning_msg}")
+                record_rpc_warning(
+                    "order_broadcast_delay",
+                    warning_msg,
+                    source=fn_name,
+                    latency_ms=latency_ms,
+                )
+            return result
+        except concurrent.futures.TimeoutError as e:
+            latency_ms = round((time.time() - started_at) * 1000, 2)
+            error_msg = f"API 呼叫 {fn_name} 逾時 ({timeout}s)"
+            record_api_error(
+                fn_name,
+                error_msg,
                 latency_ms=latency_ms,
+                timeout_sec=timeout,
+                attempt=attempt + 1,
             )
-        raise TimeoutError(error_msg) from e
-    except Exception as e:
-        latency_ms = round((time.time() - started_at) * 1000, 2)
-        record_api_error(
-            fn_name,
-            e,
-            latency_ms=latency_ms,
-            timeout_sec=timeout,
-        )
-        raise
+            if fn_name in {"get_balance_allowance", "get_order", "get_order_book"}:
+                warning_msg = f"獲取合約數據逾時：{fn_name}（{timeout}s）"
+                print(f"⚠️ {warning_msg}")
+                record_rpc_warning(
+                    "contract_data_timeout",
+                    warning_msg,
+                    source=fn_name,
+                    latency_ms=latency_ms,
+                    attempt=attempt + 1,
+                )
+            if attempt < retries:
+                wait_sec = min(2.0, 0.35 * (2 ** attempt)) + random.uniform(0, 0.12)
+                record_rpc_warning(
+                    "api_retry",
+                    f"{fn_name} timeout，{wait_sec:.2f}s 後重試",
+                    source=fn_name,
+                    attempt=attempt + 1,
+                    decision_reason="timeout",
+                )
+                time.sleep(wait_sec)
+                continue
+            raise TimeoutError(error_msg) from e
+        except Exception as e:
+            latency_ms = round((time.time() - started_at) * 1000, 2)
+            record_api_error(
+                fn_name,
+                e,
+                latency_ms=latency_ms,
+                timeout_sec=timeout,
+                attempt=attempt + 1,
+            )
+            if attempt < retries and _should_retry_error(e):
+                wait_sec = min(2.0, 0.35 * (2 ** attempt)) + random.uniform(0, 0.12)
+                record_rpc_warning(
+                    "api_retry",
+                    f"{fn_name} 發生可重試錯誤，{wait_sec:.2f}s 後重試",
+                    source=fn_name,
+                    attempt=attempt + 1,
+                    error_text=str(e),
+                    decision_reason="retryable_exception",
+                )
+                time.sleep(wait_sec)
+                continue
+            raise
+
+
+def extract_list_payload(payload, keys: tuple[str, ...] = ("data", "results", "items")) -> list:
+    """統一提取列表型 payload，兼容 list 與 dict 包裝格式。"""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in keys:
+            val = payload.get(key)
+            if isinstance(val, list):
+                return val
+    return []
+
+
+def extract_object_payload(payload, keys: tuple[str, ...] = ("data", "result")) -> dict:
+    """統一提取物件型 payload，兼容 dict 直出與 dict 包裝格式。"""
+    if isinstance(payload, dict):
+        for key in keys:
+            val = payload.get(key)
+            if isinstance(val, dict):
+                return val
+        return payload
+    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+        return payload[0]
+    return {}
+
+
+def http_get_json(url: str, *, params: dict | None = None, timeout: int = 8, retries: int = 2):
+    """
+    requests GET + JSON 解析，內建讀取端點重試策略（429/5xx/連線/逾時）。
+    """
+    retries = max(int(retries), 0)
+    for attempt in range(retries + 1):
+        started_at = time.time()
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+            status = int(resp.status_code)
+            if status in {429, 500, 502, 503, 504} and attempt < retries:
+                wait_sec = min(2.0, 0.35 * (2 ** attempt)) + random.uniform(0, 0.12)
+                record_rpc_warning(
+                    "http_retry",
+                    f"GET {url} status={status}，{wait_sec:.2f}s 後重試",
+                    source="http_get_json",
+                    attempt=attempt + 1,
+                    status_code=status,
+                    url=url,
+                    decision_reason="retryable_status_code",
+                )
+                time.sleep(wait_sec)
+                continue
+            resp.raise_for_status()
+            payload = resp.json()
+            latency_ms = round((time.time() - started_at) * 1000, 2)
+            log_event(
+                "api_call",
+                api_name="requests.get",
+                url=url,
+                latency_ms=latency_ms,
+                timeout_sec=timeout,
+                ok=True,
+                attempt=attempt + 1,
+                status_code=status,
+            )
+            return payload
+        except (requests.RequestException, ValueError) as e:
+            latency_ms = round((time.time() - started_at) * 1000, 2)
+            record_api_error(
+                "requests.get",
+                e,
+                url=url,
+                timeout_sec=timeout,
+                latency_ms=latency_ms,
+                attempt=attempt + 1,
+            )
+            if attempt < retries and _should_retry_error(e):
+                wait_sec = min(2.0, 0.35 * (2 ** attempt)) + random.uniform(0, 0.12)
+                record_rpc_warning(
+                    "http_retry",
+                    f"GET {url} 失敗，{wait_sec:.2f}s 後重試",
+                    source="http_get_json",
+                    attempt=attempt + 1,
+                    error_text=str(e),
+                    url=url,
+                    decision_reason="retryable_exception",
+                )
+                time.sleep(wait_sec)
+                continue
+            raise
 
 
 def log_trade(data: dict):
@@ -142,8 +298,10 @@ def _get_order_id(resp) -> str | None:
     """
     if hasattr(resp, "orderID") and resp.orderID:
         return resp.orderID
+    if hasattr(resp, "orderId") and resp.orderId:
+        return resp.orderId
     if isinstance(resp, dict):
-        return resp.get("orderID") or resp.get("id")
+        return resp.get("orderID") or resp.get("orderId") or resp.get("id")
     return None
 
 
@@ -158,7 +316,8 @@ def get_usdc_balance() -> float:
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         resp = _api_call_with_timeout(client.get_balance_allowance, params)
         # balance 單位是 wei（USDC 6位小數），轉換為 USDC
-        balance_wei = int(resp.get("balance", 0))
+        balance_raw = resp.get("balance", 0) if isinstance(resp, dict) else getattr(resp, "balance", 0)
+        balance_wei = int(balance_raw or 0)
         return balance_wei / 1_000_000
     except Exception as e:
         print(f"⚠️ 查詢 USDC 餘額失敗: {e}")
@@ -176,7 +335,8 @@ def get_conditional_token_balance(token_id: str) -> float:
             token_id=str(token_id),
         )
         resp = _api_call_with_timeout(client.get_balance_allowance, params)
-        balance_raw = int(resp.get("balance", 0))
+        raw = resp.get("balance", 0) if isinstance(resp, dict) else getattr(resp, "balance", 0)
+        balance_raw = int(raw or 0)
         # CLOB 返回 1e6 精度
         return balance_raw / 1_000_000
     except Exception as e:
@@ -197,19 +357,24 @@ def fetch_live_positions(timeout: int = 8) -> dict[str, dict] | None:
     失敗時回傳 None，呼叫端可決定是否降級處理。
     """
     try:
-        resp = requests.get(
+        payload = http_get_json(
             "https://data-api.polymarket.com/positions",
             params={"user": FUNDER_ADDRESS},
             timeout=timeout,
         )
-        resp.raise_for_status()
-        payload = resp.json()
-        if not isinstance(payload, list):
+        if isinstance(payload, list):
+            rows = payload
+        else:
+            rows = extract_list_payload(payload, keys=("data", "results", "items", "positions"))
+
+        if not isinstance(rows, list):
             print(f"⚠️ Data API positions 回應格式異常: {type(payload)}")
+            return {}
+        if not rows:
             return {}
 
         out: dict[str, dict] = {}
-        for row in payload:
+        for row in rows:
             if not isinstance(row, dict):
                 continue
             token_id = str(row.get("asset") or "").strip()

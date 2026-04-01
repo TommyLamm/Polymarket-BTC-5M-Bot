@@ -6,7 +6,8 @@ import datetime
 
 import pandas as pd
 import numpy as np
-import requests
+
+from btc5m.utils import http_get_json
 
 
 # ======================================================
@@ -19,23 +20,26 @@ def get_btc_signals() -> dict:
     多頭/空頭各有最多 100 分，達到 55 分即觸發，以量取勝。
     """
     try:
+        def _fetch_klines(interval: str, limit: int):
+            payload = http_get_json(
+                "https://api.binance.com/api/v3/klines",
+                params={"symbol": "BTCUSDT", "interval": interval, "limit": limit},
+                timeout=5,
+                retries=2,
+            )
+            if not isinstance(payload, list):
+                raise ValueError(f"Binance kline response invalid type: {type(payload)}")
+            return payload
+
         # ── 4H 大趨勢（保留原邏輯）──────────────────────────
-        r4h = requests.get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol": "BTCUSDT", "interval": "4h", "limit": 60},
-            timeout=5
-        ).json()
+        r4h = _fetch_klines("4h", 60)
         df4 = pd.DataFrame(r4h, columns=['t','o','h','l','c','v','T','qav','nt','tbv','tqv','i'])
         df4['c'] = df4['c'].astype(float)
         ema_4h        = df4['c'].ewm(span=50, adjust=False).mean().iloc[-1]
         trend_bullish = df4['c'].iloc[-1] > ema_4h
 
         # ── 5m K線資料（保留原邏輯）─────────────────────────
-        r5m = requests.get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol": "BTCUSDT", "interval": "5m", "limit": 100},
-            timeout=5
-        ).json()
+        r5m = _fetch_klines("5m", 100)
         df = pd.DataFrame(r5m, columns=['t','o','h','l','c','v','T','qav','nt','tbv','tqv','i'])
         for col in ['o','h','l','c','v']:
             df[col] = df[col].astype(float)
@@ -71,11 +75,7 @@ def get_btc_signals() -> dict:
         df['adx'] = dx.ewm(alpha=1/14, adjust=False).mean()
 
         # ── 1m 超短線動能（新增）────────────────────────────
-        r1m = requests.get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol": "BTCUSDT", "interval": "1m", "limit": 30},
-            timeout=5
-        ).json()
+        r1m = _fetch_klines("1m", 30)
         df1 = pd.DataFrame(r1m, columns=['t','o','h','l','c','v','T','qav','nt','tbv','tqv','i'])
         df1['c'] = df1['c'].astype(float)
         df1['v'] = df1['v'].astype(float)
@@ -89,11 +89,7 @@ def get_btc_signals() -> dict:
         vol1m_ratio = df1['v'].iloc[-1] / df1['v'].rolling(10).mean().iloc[-1]
 
         # ── 15m 趨勢確認（新增）─────────────────────────────
-        r15m = requests.get(
-            "https://api.binance.com/api/v3/klines",
-            params={"symbol": "BTCUSDT", "interval": "15m", "limit": 30},
-            timeout=5
-        ).json()
+        r15m = _fetch_klines("15m", 30)
         df15 = pd.DataFrame(r15m, columns=['t','o','h','l','c','v','T','qav','nt','tbv','tqv','i'])
         df15['c'] = df15['c'].astype(float)
         ema9_15m  = df15['c'].ewm(span=9,  adjust=False).mean()

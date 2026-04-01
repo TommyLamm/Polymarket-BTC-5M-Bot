@@ -6,13 +6,11 @@ import time
 import json
 import datetime
 
-import requests
-
 from btc5m.config import (
     BTC5M_SERIES_ID, BTC5M_SERIES_SLUG,
     _market_cache, _market_cache_ts, _MARKET_CACHE_TTL,
 )
-from btc5m.utils import send
+from btc5m.utils import send, http_get_json, extract_list_payload, extract_object_payload
 
 # 用模組層級可變變數追蹤快取（不能直接覆蓋 config 裡的 import）
 import btc5m.config as _cfg
@@ -39,39 +37,43 @@ def fetch_active_btc5m_markets() -> list[dict]:
 
     # ── 主力：Series API ────────────────────────────────
     try:
-        resp = requests.get(
+        payload = http_get_json(
             f"https://gamma-api.polymarket.com/series/{BTC5M_SERIES_ID}",
-            timeout=8
+            timeout=8,
+            retries=2,
         )
-        if resp.status_code == 200:
-            now_dt = datetime.datetime.now(datetime.timezone.utc)
-            events = resp.json().get("events", [])
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        series_obj = extract_object_payload(payload)
+        events = extract_list_payload(
+            series_obj.get("events", []) if isinstance(series_obj, dict) else []
+        )
 
-            active_candidates = []
-            for e in events:
-                if not (e.get("active") and not e.get("closed")):
-                    continue
-                end_raw = e.get("endDate") or e.get("endDateIso", "")
-                if not end_raw:
-                    continue
-                try:
-                    end_dt = datetime.datetime.fromisoformat(
-                                 end_raw.replace("Z", "+00:00"))
-                except ValueError:
-                    continue
-                if end_dt > now_dt:
-                    active_candidates.append((end_dt, e))
+        active_candidates = []
+        for e in events:
+            if not isinstance(e, dict):
+                continue
+            if not (e.get("active") and not e.get("closed")):
+                continue
+            end_raw = e.get("endDate") or e.get("endDateIso", "")
+            if not end_raw:
+                continue
+            try:
+                end_dt = datetime.datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if end_dt > now_dt:
+                active_candidates.append((end_dt, e))
 
-            if active_candidates:
-                # 取 endDate 最近的事件（即當前 5 分鐘窗口）
-                _, current_event = min(active_candidates, key=lambda x: x[0])
-                markets = current_event.get("markets", [])
-                if markets:
-                    _cfg._market_cache    = markets
-                    _cfg._market_cache_ts = now_ts
-                    print(f"✅ [Series API] 窗口: {current_event.get('slug')} "
-                          f"| {len(markets)} 個子市場")
-                    return markets
+        if active_candidates:
+            # 取 endDate 最近的事件（即當前 5 分鐘窗口）
+            _, current_event = min(active_candidates, key=lambda x: x[0])
+            markets = extract_list_payload(current_event.get("markets", []))
+            if markets:
+                _cfg._market_cache = markets
+                _cfg._market_cache_ts = now_ts
+                print(f"✅ [Series API] 窗口: {current_event.get('slug')} "
+                      f"| {len(markets)} 個子市場")
+                return markets
     except Exception as e:
         print(f"⚠️ Series API 失敗: {e}")
 
@@ -80,18 +82,18 @@ def fetch_active_btc5m_markets() -> list[dict]:
     for delta in (0, -300, 300):
         slug = f"btc-updown-5m-{base_ts + delta}"
         try:
-            resp = requests.get(
+            payload = http_get_json(
                 f"https://gamma-api.polymarket.com/events/slug/{slug}",
-                timeout=8
+                timeout=8,
+                retries=2,
             )
-            if resp.status_code == 200:
-                event   = resp.json()
-                markets = event.get("markets", [])
-                if event.get("active") and not event.get("closed") and markets:
-                    _cfg._market_cache    = markets
-                    _cfg._market_cache_ts = now_ts
-                    print(f"✅ [slug 備援] {slug} | {len(markets)} 個子市場")
-                    return markets
+            event = extract_object_payload(payload)
+            markets = extract_list_payload(event.get("markets", []) if isinstance(event, dict) else [])
+            if event.get("active") and not event.get("closed") and markets:
+                _cfg._market_cache = markets
+                _cfg._market_cache_ts = now_ts
+                print(f"✅ [slug 備援] {slug} | {len(markets)} 個子市場")
+                return markets
         except Exception as e:
             print(f"⚠️ slug 備援查詢失敗 ({slug}): {e}")
 

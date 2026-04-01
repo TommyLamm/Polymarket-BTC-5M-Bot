@@ -23,7 +23,12 @@ from btc5m.utils import (
 from btc5m.market import fetch_active_btc5m_markets, _resolve_token_id
 from btc5m.signals import get_btc_signals
 from btc5m.position_manager import manage_positions
-from btc5m.order_execution_utils import _poll_order_matched, _quantize_down, _quantize_up
+from btc5m.order_execution_utils import (
+    _poll_order_matched,
+    _quantize_down,
+    _quantize_up,
+    _extract_orderbook_constraints,
+)
 from btc5m.observability import (
     log_event,
     record_api_error,
@@ -226,7 +231,9 @@ def analyze_and_trade():
 
                 fee_rate = 0.0156
                 cap_usd = float(MAX_USD)
-                min_size = float(gm.get("orderMinSize") or 1)
+                _, min_orderbook_size = _extract_orderbook_constraints(book)
+                market_min_size = float(gm.get("orderMinSize") or 0.0)
+                min_size = max(min_orderbook_size, market_min_size, 0.01)
                 conf_multiplier = 1.5 if btc_info.get("high_conf") else 1.0
                 proposed_size = max(round(cap_usd * conf_multiplier / best_ask, 2), 0.01)
 

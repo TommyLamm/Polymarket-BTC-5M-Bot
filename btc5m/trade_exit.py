@@ -27,8 +27,83 @@ from btc5m.order_execution_utils import (
     _poll_order_matched,
 )
 from btc5m.observability import record_api_error, record_order_attempt, record_order_result
+from btc5m.observability import record_position_event
 from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.order_builder.constants import SELL
+
+
+_DUST_NOTIFY_INTERVAL_SEC = 180
+_NO_ORDERBOOK_NOTIFY_INTERVAL_SEC = 180
+
+
+def _mark_dust_pending_settlement(
+    token_id: str,
+    pos: dict,
+    min_order_size: float,
+    reason: str = "",
+):
+    now_ts = time.time()
+    with _positions_lock:
+        cur = open_positions.get(token_id)
+        if cur is None:
+            return
+        cur["exit_state"] = "dust_pending_settlement"
+        cur["exit_state_reason"] = reason or "below_min_order_size"
+        cur["dust_min_order_size"] = float(min_order_size)
+        last_notice = float(cur.get("dust_notified_at", 0.0) or 0.0)
+        should_notify = (now_ts - last_notice) >= _DUST_NOTIFY_INTERVAL_SEC
+        if should_notify:
+            cur["dust_notified_at"] = now_ts
+        cur["last_close_attempt_at"] = now_ts
+        cur["last_close_blocked_reason"] = "dust_below_min_order_size"
+        cur["last_close_blocked_at"] = now_ts
+        dust_size = float(cur.get("size", pos.get("size", 0.0)) or 0.0)
+
+    record_position_event(
+        "exit_dust_below_min_size",
+        message="exit blocked by min order size",
+        token_id=token_id,
+        dust_size=dust_size,
+        min_order_size=float(min_order_size),
+    )
+    if should_notify:
+        send(
+            f"⚠️ 平倉改為結算監控：殘量低於最小下單量\n"
+            f"Token: {token_id[:12]}…\n"
+            f"殘量: {dust_size:.4f} | 最小下單量: {float(min_order_size):.4f}\n"
+            f"已切換為低頻對賬，待 balance=0 或 redeemable=true 才清除。"
+        )
+
+
+def _handle_no_orderbook_exit(token_id: str, pos: dict, error: Exception):
+    err_text = str(error)
+    if "no orderbook exists for the requested token id" not in err_text.lower():
+        raise error
+
+    now_ts = time.time()
+    with _positions_lock:
+        cur = open_positions.get(token_id)
+        if cur is None:
+            return
+        last_notice = float(cur.get("no_orderbook_notified_at", 0.0) or 0.0)
+        should_notify = (now_ts - last_notice) >= _NO_ORDERBOOK_NOTIFY_INTERVAL_SEC
+        if should_notify:
+            cur["no_orderbook_notified_at"] = now_ts
+
+    record_position_event(
+        "settlement_no_orderbook",
+        message="get_order_book returned no orderbook",
+        token_id=token_id,
+        error_text=err_text,
+    )
+    if should_notify:
+        send(
+            f"⚠️ 平倉改為結算對賬：市場已無訂單簿\n"
+            f"Token: {token_id[:12]}…\n"
+            f"原因: {err_text}\n"
+            f"將持續低頻監控至 balance=0 或 redeemable=true。"
+        )
+    _reconcile_position_after_exit_attempt(token_id, pos)
 
 
 def _notify_position_pending_redeem(token_id: str, pos: dict, hold_seconds: float, reason: str = ""):
@@ -75,6 +150,17 @@ def _reconcile_position_after_exit_attempt(token_id: str, pos: dict) -> bool:
         hold_seconds = (
             datetime.datetime.now(datetime.timezone.utc) - pos["opened_at"]
         ).total_seconds()
+        record_position_event(
+            "settlement_reconciled_closed",
+            message="exit reconcile removed local position",
+            token_id=token_id,
+            source="trade_exit_reconcile",
+            hold_seconds=hold_seconds,
+            local_size=local_size,
+            live_size=live_size,
+            balance_size=token_balance,
+            decision_reason="row_missing_and_effective_zero",
+        )
         send(
             f"✅ 對賬確認：鏈上已無該持倉\n"
             f"Token: {token_id[:12]}… | 持倉時間: {int(hold_seconds)}s"
@@ -87,6 +173,17 @@ def _reconcile_position_after_exit_attempt(token_id: str, pos: dict) -> bool:
         hold_seconds = (
             datetime.datetime.now(datetime.timezone.utc) - pos["opened_at"]
         ).total_seconds()
+        record_position_event(
+            "settlement_redeemable_cleared",
+            message="exit reconcile cleared redeemable position",
+            token_id=token_id,
+            source="trade_exit_reconcile",
+            hold_seconds=hold_seconds,
+            local_size=local_size,
+            live_size=live_size,
+            balance_size=token_balance,
+            decision_reason="redeemable_true",
+        )
         _notify_position_pending_redeem(
             token_id,
             pos,
@@ -99,6 +196,17 @@ def _reconcile_position_after_exit_attempt(token_id: str, pos: dict) -> bool:
         with _positions_lock:
             if token_id in open_positions:
                 open_positions[token_id]["size"] = max(effective_size, 0.0)
+    record_position_event(
+        "settlement_reconcile_pending",
+        message="exit reconcile kept position for monitoring",
+        token_id=token_id,
+        source="trade_exit_reconcile",
+        local_size=local_size,
+        live_size=live_size,
+        balance_size=token_balance,
+        effective_size=effective_size,
+        decision_reason="position_still_exists",
+    )
 
     return False
 
@@ -161,7 +269,11 @@ def _close_position(token_id: str, reason: str = None, tp_target: float = None, 
         time.sleep(1)
 
     try:
-        book = _api_call_with_timeout(client.get_order_book, token_id)
+        try:
+            book = _api_call_with_timeout(client.get_order_book, token_id)
+        except Exception as e:
+            _handle_no_orderbook_exit(token_id, pos, e)
+            return
         best_bid, best_ask = _parse_orderbook(book)
         if best_bid is None or best_ask is None:
             send(f"⚠️ 平倉失敗：訂單簿無流動性\n"
@@ -180,10 +292,15 @@ def _close_position(token_id: str, reason: str = None, tp_target: float = None, 
             if cap_size_by_entry > 0:
                 safe_size = min(safe_size, cap_size_by_entry)
         if safe_size + 1e-9 < min_order_size:
-            send(f"⚠️ 平倉失敗：可賣數量無效\nToken: {token_id[:12]}…\n持倉: {size:.4f}")
             live_positions = fetch_live_positions()
             live_row = live_positions.get(token_id) if isinstance(live_positions, dict) else None
             _sync_local_position_size(token_id, pos, live_row)
+            _mark_dust_pending_settlement(
+                token_id,
+                pos,
+                min_order_size=min_order_size,
+                reason=reason or "below_min_order_size",
+            )
             _reconcile_position_after_exit_attempt(token_id, pos)
             return
         safe_size = min(safe_size, size)
@@ -325,6 +442,14 @@ def _close_position(token_id: str, reason: str = None, tp_target: float = None, 
                 if token_id in open_positions:
                     open_positions[token_id]["size"] = remaining_size
                     open_positions[token_id].pop("pending_sell_oid", None)
+                    if remaining_size + 1e-9 < min_order_size:
+                        open_positions[token_id]["exit_state"] = "dust_pending_settlement"
+                        open_positions[token_id]["dust_min_order_size"] = float(min_order_size)
+                    else:
+                        open_positions[token_id].pop("exit_state", None)
+                        open_positions[token_id].pop("exit_state_reason", None)
+                        open_positions[token_id].pop("dust_min_order_size", None)
+                        open_positions[token_id].pop("dust_notified_at", None)
 
         if fully_closed:
             with _consecutive_losses_lock:

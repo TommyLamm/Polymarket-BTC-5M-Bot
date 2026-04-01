@@ -55,11 +55,23 @@ def parse_orderbook(book):
     return max(_p(b) for b in bids), min(_p(a) for a in asks)
 
 
+def _extract_list_payload(payload, keys=("data", "results", "items", "trades")):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in keys:
+            val = payload.get(key)
+            if isinstance(val, list):
+                return val
+    return []
+
+
 def get_all_positions():
     """透過 get_trades 取得鏈上持倉"""
     print("📊 查詢鏈上交易記錄...")
     try:
-        trades = client.get_trades()
+        trades_resp = client.get_trades()
+        trades = _extract_list_payload(trades_resp, keys=("data", "results", "items", "trades"))
         print(f"   找到 {len(trades)} 筆交易記錄")
     except Exception as e:
         print(f"❌ get_trades 失敗: {e}")
@@ -68,6 +80,8 @@ def get_all_positions():
     positions = {}
     funder_lower = FUNDER_ADDRESS.lower()
     for t in trades:
+        if not isinstance(t, dict):
+            continue
         maker = str(t.get("maker") or t.get("maker_address") or "").lower()
         taker = str(t.get("taker") or t.get("taker_address") or "").lower()
         if maker != funder_lower and taker != funder_lower:
