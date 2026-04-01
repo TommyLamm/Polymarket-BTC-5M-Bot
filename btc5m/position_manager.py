@@ -8,6 +8,7 @@ import datetime
 from btc5m.config import (
     client,
     POS_MAX_HOLD_SEC,
+    STOPLOSS_CONFIRM_COUNT, STOPLOSS_EMERGENCY_EXTRA_PCT,
     open_positions, _recently_closed,
     _positions_lock, _manage_lock,
 )
@@ -17,6 +18,7 @@ from btc5m.utils import (
     get_usdc_balance, get_conditional_token_balance,
 )
 from btc5m.trade_exit import _close_position
+from btc5m.observability import record_api_error
 
 
 def _reconcile_settlement_state(token_id: str, pos: dict, hold_seconds: float, source: str) -> bool:
@@ -118,6 +120,12 @@ def manage_positions():
                 best_bid, _ = _parse_orderbook(book)
             except Exception as e:
                 print(f"📊 持倉監控 - 訂單簿查詢失敗: {e} | token={token_id[:12]}…")
+                record_api_error(
+                    "position_manager_get_order_book",
+                    e,
+                    token_id=token_id,
+                    hold_seconds=hold_seconds,
+                )
                 if hold_seconds > 330:
                     reconciled = _reconcile_settlement_state(
                         token_id, pos, hold_seconds, source="訂單簿查詢失敗"
@@ -160,9 +168,39 @@ def manage_positions():
             if best_bid >= tp_target:
                 reason = "🎯 達到動態止盈"
             elif best_bid <= sl_target:
-                reason = "🚨 觸發動態止損"
+                emergency_sl = sl_target * (1 - STOPLOSS_EMERGENCY_EXTRA_PCT)
+                if best_bid <= emergency_sl:
+                    reason = "🚨 觸發緊急止損"
+                    with _positions_lock:
+                        if token_id in open_positions:
+                            open_positions[token_id]["sl_confirm_count"] = 0
+                else:
+                    with _positions_lock:
+                        cur = open_positions.get(token_id)
+                        if cur is None:
+                            continue
+                        cur_cnt = int(cur.get("sl_confirm_count", 0)) + 1
+                        cur["sl_confirm_count"] = cur_cnt
+                    if cur_cnt >= STOPLOSS_CONFIRM_COUNT:
+                        reason = "🚨 觸發動態止損(連續確認)"
+                    else:
+                        if cur_cnt == 1 or cur_cnt % 2 == 0:
+                            send(
+                                f"⚠️ 止損觀察中 ({cur_cnt}/{STOPLOSS_CONFIRM_COUNT})\n"
+                                f"📋 {pos['question'][:40]}\n"
+                                f"現價: {best_bid:.3f} | SL: {sl_target:.3f}\n"
+                                f"短暫回撤不立即平倉，等待連續確認。"
+                            )
+                        continue
             elif hold_seconds >= max_hold:
                 reason = "⏰ 結算規避/超時"
+                with _positions_lock:
+                    if token_id in open_positions:
+                        open_positions[token_id]["sl_confirm_count"] = 0
+            else:
+                with _positions_lock:
+                    if token_id in open_positions:
+                        open_positions[token_id]["sl_confirm_count"] = 0
 
             if reason:
                 fee_rate = 0.0156

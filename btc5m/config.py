@@ -91,6 +91,7 @@ ORDER_TIMEOUT     = 10      # 訂單輪詢超時秒數
 MIN_SPREAD        = 0.015   # 最小有效買賣價差
 MAX_SPREAD        = 0.2     # 最大容許買賣價差
 START_CAPITAL     = 75     # 初始資本基準（用於計算每日風控門檻）
+ENTRY_COST_TOLERANCE_USD = 0.02  # 成交成本超出 MAX_USD 的容忍值
 
 # ======================================================
 # 🛡️  風控與持倉參數
@@ -100,6 +101,8 @@ MAX_POSITIONS          = 3     # 最多同時持有部位數
 COOLDOWN_SEC           = 30    # 同一代幣平倉後冷卻時間
 CONSECUTIVE_LOSS_LIMIT = 3     # 連續虧損觸發熔斷的次數
 PAUSE_AFTER_LOSS_SEC   = 900   # 熔斷後暫停時間（15 分鐘）
+STOPLOSS_CONFIRM_COUNT = 3     # 止損連續確認次數
+STOPLOSS_EMERGENCY_EXTRA_PCT = 0.05  # 超過 SL 額外跌幅時啟用緊急止損
 
 # ======================================================
 # 🗂️  共享狀態

@@ -3,7 +3,7 @@ btc5m.order_execution_utils — 交易流程共用工具（狀態正規化、量
 """
 
 import time
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 
 from btc5m.config import client, ORDER_TIMEOUT
 from btc5m.utils import _api_call_with_timeout
@@ -30,6 +30,19 @@ def _quantize_down(value: float, step: float, minimum: float = 0.0) -> float:
     if step_dec <= 0:
         return float(max(value_dec, min_dec))
     units = (value_dec / step_dec).to_integral_value(rounding=ROUND_DOWN)
+    quantized = units * step_dec
+    if quantized < min_dec:
+        quantized = min_dec
+    return float(quantized)
+
+
+def _quantize_up(value: float, step: float, minimum: float = 0.0) -> float:
+    value_dec = _to_decimal(value, "0")
+    step_dec = _to_decimal(step, "0.01")
+    min_dec = _to_decimal(minimum, "0")
+    if step_dec <= 0:
+        return float(max(value_dec, min_dec))
+    units = (value_dec / step_dec).to_integral_value(rounding=ROUND_UP)
     quantized = units * step_dec
     if quantized < min_dec:
         quantized = min_dec
@@ -112,6 +125,10 @@ def _poll_order_matched(oid: str, fallback_price: float, fail_on_unmatched: bool
     while time.time() - t0 < ORDER_TIMEOUT:
         try:
             st = _api_call_with_timeout(client.get_order, oid)
+            if st is None:
+                print("🔍 輪詢結果為空，等待下次查詢")
+                time.sleep(1)
+                continue
             status_raw = (getattr(st, "status", "") if hasattr(st, "status")
                           else st.get("status", ""))
             status = _normalize_order_status(status_raw)

@@ -9,6 +9,7 @@ import btc5m.config as cfg
 from btc5m.config import (
     client,
     MAX_USD, SLIPPAGE, MIN_SPREAD, MAX_SPREAD,
+    ENTRY_COST_TOLERANCE_USD,
     DAILY_MAX_LOSS, DAILY_TAKE_PROFIT,
     POS_MAX_HOLD_SEC, MAX_POSITIONS, COOLDOWN_SEC,
     open_positions, _recently_closed,
@@ -22,9 +23,21 @@ from btc5m.utils import (
 from btc5m.market import fetch_active_btc5m_markets, _resolve_token_id
 from btc5m.signals import get_btc_signals
 from btc5m.position_manager import manage_positions
-from btc5m.order_execution_utils import _poll_order_matched, _quantize_down
+from btc5m.order_execution_utils import _poll_order_matched, _quantize_down, _quantize_up
+from btc5m.observability import (
+    log_event,
+    record_api_error,
+    record_missed_trade,
+    record_order_attempt,
+    record_order_result,
+    summarize_missed_trades,
+)
 from py_clob_client.clob_types import OrderArgs
 from py_clob_client.order_builder.constants import BUY
+
+ATM_MIN_ASK = 0.30
+ATM_MAX_ASK = 0.70
+ENTRY_MIN_TIME_LEFT_SEC = 60
 
 
 def analyze_and_trade():
@@ -92,6 +105,7 @@ def analyze_and_trade():
         markets = fetch_active_btc5m_markets()
         if not markets:
             print("⚠️ 找不到 BTC 5M 子市場")
+            record_missed_trade("market_fetch_empty", "找不到活躍市場")
             return
 
         print(f"\n🔎 開始掃描 {len(markets)} 個子市場...")
@@ -102,9 +116,15 @@ def analyze_and_trade():
 
             if not gm.get("acceptingOrders", False):
                 print("     ❌ 跳過：acceptingOrders=False")
+                record_missed_trade(
+                    "market_not_accepting_orders",
+                    "acceptingOrders=False",
+                    market=q,
+                )
                 continue
             if gm.get("negRisk", False):
                 print("     ❌ 跳過：negRisk 市場")
+                record_missed_trade("market_neg_risk", "negRisk=True", market=q)
                 continue
 
             time_left = 300
@@ -114,8 +134,13 @@ def analyze_and_trade():
                     end_dt = datetime.datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
                     time_left = (end_dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
                     print(f"     ⏱  剩餘時間: {int(time_left)}s")
-                    if time_left < 60:
-                        print("     ❌ 跳過：剩餘時間 < 60s")
+                    if time_left < ENTRY_MIN_TIME_LEFT_SEC:
+                        print(f"     ❌ 跳過：剩餘時間 < {ENTRY_MIN_TIME_LEFT_SEC}s")
+                        record_missed_trade(
+                            "time_left_lt_60",
+                            f"time_left={int(time_left)}",
+                            market=q,
+                        )
                         continue
                 except ValueError:
                     pass
@@ -123,16 +148,29 @@ def analyze_and_trade():
             target_token_id, outcome_label = _resolve_token_id(gm, signal_dir)
             if not target_token_id:
                 print(f"     ❌ 跳過：無法解析代幣 ID (outcomes={gm.get('outcomes')})")
+                record_missed_trade("token_unresolved", "resolve_token_id_failed", market=q)
                 continue
             print(f"     🎯 目標 outcome: {outcome_label}  token: {target_token_id[:12]}…")
 
             with _positions_lock:
                 if target_token_id in open_positions:
                     print("     ❌ 跳過：此代幣已持倉")
+                    record_missed_trade(
+                        "already_holding_token",
+                        "token already in open_positions",
+                        market=q,
+                        token_id=target_token_id,
+                    )
                     continue
             if (target_token_id in _recently_closed and
                     time.time() - _recently_closed[target_token_id] < COOLDOWN_SEC):
                 print("     ❌ 跳過：冷卻中")
+                record_missed_trade(
+                    "token_cooldown",
+                    "token within cooldown window",
+                    market=q,
+                    token_id=target_token_id,
+                )
                 continue
 
             try:
@@ -142,16 +180,37 @@ def analyze_and_trade():
 
                 if best_bid is None or best_ask is None:
                     print("     ❌ 跳過：訂單簿無流動性")
+                    record_missed_trade(
+                        "orderbook_no_liquidity",
+                        "best_bid or best_ask is None",
+                        market=q,
+                        token_id=target_token_id,
+                    )
                     continue
 
-                if not (0.30 <= best_ask <= 0.70):
-                    print(f"     ❌ 跳過：ask={best_ask:.3f} 不在 ATM 範圍 [0.30, 0.70]")
+                if not (ATM_MIN_ASK <= best_ask <= ATM_MAX_ASK):
+                    print(
+                        f"     ❌ 跳過：ask={best_ask:.3f} 不在 ATM 範圍 "
+                        f"[{ATM_MIN_ASK:.2f}, {ATM_MAX_ASK:.2f}]"
+                    )
+                    record_missed_trade(
+                        "ask_not_atm",
+                        f"ask={best_ask:.3f}",
+                        market=q,
+                        token_id=target_token_id,
+                    )
                     continue
 
                 spread = best_ask - best_bid
                 print(f"     📐 價差: {spread:.4f}  (需在 [{MIN_SPREAD}, {MAX_SPREAD}])")
                 if spread < MIN_SPREAD or spread > MAX_SPREAD:
                     print("     ❌ 跳過：價差不符條件")
+                    record_missed_trade(
+                        "spread_out_of_range",
+                        f"spread={spread:.4f}",
+                        market=q,
+                        token_id=target_token_id,
+                    )
                     continue
 
                 tp_pct = 0.08
@@ -174,26 +233,51 @@ def analyze_and_trade():
                 unit_cost = limit_price * (1 + fee_rate)
                 if unit_cost <= 0:
                     print("     ❌ 跳過：單位成本無效")
+                    record_missed_trade(
+                        "unit_cost_invalid",
+                        f"unit_cost={unit_cost}",
+                        market=q,
+                        token_id=target_token_id,
+                    )
                     continue
 
                 max_affordable_size = _quantize_down(cap_usd / unit_cost, 0.01, 0.0)
                 if max_affordable_size <= 0:
                     print(f"     ❌ 跳過：1 USD 上限下不可下單 (unit_cost={unit_cost:.4f})")
+                    record_missed_trade(
+                        "max_affordable_size_zero",
+                        f"cap={cap_usd},unit_cost={unit_cost:.4f}",
+                        market=q,
+                        token_id=target_token_id,
+                    )
                     continue
 
-                if min_size - max_affordable_size > 1e-9:
+                min_size_aligned = _quantize_up(min_size, 0.01, 0.01)
+                if min_size_aligned - max_affordable_size > 1e-9:
                     print(
                         f"     ❌ 跳過：最小下單量超過風險上限 "
-                        f"(min_size={min_size:.4f} > cap_size={max_affordable_size:.4f})"
+                        f"(min_size={min_size_aligned:.4f} > cap_size={max_affordable_size:.4f})"
+                    )
+                    record_missed_trade(
+                        "min_size_over_cap",
+                        f"min_size={min_size_aligned:.4f},cap_size={max_affordable_size:.4f}",
+                        market=q,
+                        token_id=target_token_id,
                     )
                     continue
 
                 size = min(proposed_size, max_affordable_size)
-                size = _quantize_down(size, 0.01, min_size)
-                if size + 1e-9 < min_size:
+                size = _quantize_down(size, 0.01, min_size_aligned)
+                if size + 1e-9 < min_size_aligned:
                     print(
                         f"     ❌ 跳過：量化後數量低於最小下單量 "
-                        f"(size={size:.4f}, min_size={min_size:.4f})"
+                        f"(size={size:.4f}, min_size={min_size_aligned:.4f})"
+                    )
+                    record_missed_trade(
+                        "quantized_size_below_min",
+                        f"size={size:.4f},min_size={min_size_aligned:.4f}",
+                        market=q,
+                        token_id=target_token_id,
                     )
                     continue
 
@@ -202,6 +286,12 @@ def analyze_and_trade():
                     print(
                         f"     ❌ 跳過：成本超過硬上限 "
                         f"(cost={cost_usdc:.4f} > cap={cap_usd:.4f})"
+                    )
+                    record_missed_trade(
+                        "cost_over_cap",
+                        f"cost={cost_usdc:.4f},cap={cap_usd:.4f}",
+                        market=q,
+                        token_id=target_token_id,
                     )
                     continue
 
@@ -231,6 +321,14 @@ def analyze_and_trade():
                      f"{'─'*28}")
 
                 order_args = OrderArgs(price=limit_price, size=size, side=BUY, token_id=target_token_id)
+                attempt_id = record_order_attempt(
+                    scope="entry",
+                    side="BUY",
+                    token_id=target_token_id,
+                    market=q,
+                    limit_price=limit_price,
+                    size=size,
+                )
                 signed_order = _api_call_with_timeout(client.create_order, order_args)
                 resp = _api_call_with_timeout(client.post_order, signed_order)
 
@@ -239,14 +337,50 @@ def analyze_and_trade():
                 if not success:
                     err = (getattr(resp, "errorMsg", "")
                            or (resp.get("errorMsg", "") if isinstance(resp, dict) else ""))
+                    record_order_result(
+                        attempt_id=attempt_id,
+                        scope="entry",
+                        success=False,
+                        error_text=err,
+                        token_id=target_token_id,
+                        market=q,
+                    )
+                    record_missed_trade(
+                        "post_order_rejected",
+                        err or "post_order returned success=False",
+                        market=q,
+                        token_id=target_token_id,
+                    )
                     send(f"⚠️ 下單失敗: {err}")
                     continue
 
                 oid = _get_order_id(resp)
                 if not oid:
+                    record_order_result(
+                        attempt_id=attempt_id,
+                        scope="entry",
+                        success=False,
+                        error_text="missing_order_id",
+                        token_id=target_token_id,
+                        market=q,
+                    )
+                    record_missed_trade(
+                        "missing_order_id",
+                        "post_order response missing order id",
+                        market=q,
+                        token_id=target_token_id,
+                    )
                     send("⚠️ 無法取得訂單 ID，跳過建倉")
                     continue
 
+                record_order_result(
+                    attempt_id=attempt_id,
+                    scope="entry",
+                    success=True,
+                    order_id=oid,
+                    token_id=target_token_id,
+                    market=q,
+                )
                 send(f"📨 訂單已送出 ID: {oid[:16]}…，等待成交…")
 
                 filled, fill_price, size_matched = _poll_order_matched(oid, limit_price)
@@ -254,6 +388,13 @@ def analyze_and_trade():
                     try:
                         _api_call_with_timeout(client.cancel, oid)
                         send(f"⏰ 訂單 {oid[:12]}… 超時未成交，已取消")
+                        record_missed_trade(
+                            "order_timeout_unfilled",
+                            f"order {oid[:16]} timeout unfilled",
+                            market=q,
+                            token_id=target_token_id,
+                            order_id=oid,
+                        )
                     except Exception as cancel_err:
                         print(f"⚠️ 訂單超時取消失敗: {cancel_err}")
                     continue
@@ -269,10 +410,31 @@ def analyze_and_trade():
                 if size_matched < 0.001:
                     send(f"⚠️ size_matched={size_matched}，使用下單量 {size} 作為持倉量")
 
+                actual_cost_usdc = real_size * fill_price * (1 + fee_rate)
+                if actual_cost_usdc > cap_usd + float(ENTRY_COST_TOLERANCE_USD):
+                    record_missed_trade(
+                        "entry_actual_cost_exceeds_cap",
+                        f"actual_cost={actual_cost_usdc:.4f},cap={cap_usd:.4f}",
+                        market=q,
+                        token_id=target_token_id,
+                        order_id=oid,
+                    )
+                    send(
+                        f"🚫 風控拒絕建倉：實際成本超過上限\n"
+                        f"actual={actual_cost_usdc:.4f} > cap={cap_usd:.4f}\n"
+                        f"訂單: {oid[:16]}…，嘗試立即取消/回退"
+                    )
+                    try:
+                        _api_call_with_timeout(client.cancel, oid)
+                    except Exception as cap_cancel_err:
+                        print(f"⚠️ 超額建倉回退失敗: {cap_cancel_err}")
+                    continue
+
                 with _positions_lock:
                     open_positions[target_token_id] = {
                         "entry_price": fill_price,
                         "size": real_size,
+                        "entry_cost_usdc": actual_cost_usdc,
                         "question": q,
                         "opened_at": datetime.datetime.now(datetime.timezone.utc),
                         "entry_spread": spread,
@@ -280,7 +442,7 @@ def analyze_and_trade():
                         "tp_pct": tp_pct,
                         "sl_pct": sl_pct,
                     }
-                cost_usdc = real_size * fill_price
+                cost_usdc = actual_cost_usdc
                 tp_target = min(fill_price * (1 + tp_pct), 0.99)
                 sl_target_price = fill_price * (1 - sl_pct)
 
@@ -312,8 +474,31 @@ def analyze_and_trade():
                 return
 
             except Exception as e:
+                record_api_error(
+                    "trade_entry_market_loop",
+                    e,
+                    market=q,
+                    token_id=target_token_id if "target_token_id" in locals() else "",
+                )
+                if "get_order_book" in str(e):
+                    record_missed_trade(
+                        "orderbook_fetch_error",
+                        str(e),
+                        market=q,
+                        token_id=target_token_id if "target_token_id" in locals() else "",
+                    )
                 send(f"❌ 下單異常: {e}")
 
+        missed_summary = summarize_missed_trades(window_sec=3600)
+        if missed_summary["total"] > 0:
+            msg = (
+                f"📉 Missed Trades 摘要（近1小時）\n"
+                f"總數: {missed_summary['total']}\n"
+                f"{missed_summary['headline']}\n"
+                f"建議: {missed_summary['recommendation']}"
+            )
+            print(msg)
+            log_event("missed_trade_summary", **missed_summary)
         print("🔎 本輪掃描完畢，無符合條件的標的")
 
     except Exception as e:

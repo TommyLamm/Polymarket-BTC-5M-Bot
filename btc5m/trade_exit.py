@@ -9,6 +9,7 @@ import traceback
 import btc5m.config as cfg
 from btc5m.config import (
     client,
+    MAX_USD, ENTRY_COST_TOLERANCE_USD,
     CONSECUTIVE_LOSS_LIMIT, PAUSE_AFTER_LOSS_SEC,
     open_positions,
     _positions_lock, _pause_until_lock, _consecutive_losses_lock,
@@ -25,6 +26,7 @@ from btc5m.order_execution_utils import (
     _cancel_order_and_validate,
     _poll_order_matched,
 )
+from btc5m.observability import record_api_error, record_order_attempt, record_order_result
 from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.order_builder.constants import SELL
 
@@ -55,11 +57,17 @@ def _reconcile_position_after_exit_attempt(token_id: str, pos: dict) -> bool:
         return False
 
     row = live_positions.get(token_id)
+    local_size = float(pos.get("size", 0.0) or 0.0)
     live_size = float(row.get("size", 0.0) or 0.0) if row else 0.0
     token_balance = get_conditional_token_balance(token_id)
-    effective_size = live_size
+    candidates = [max(local_size, 0.0)]
+    if live_size >= 0:
+        candidates.append(max(live_size, 0.0))
     if token_balance >= 0:
-        effective_size = max(live_size, token_balance)
+        candidates.append(max(token_balance, 0.0))
+    # 對賬採保守值，避免本地倉位被放大
+    positive_candidates = [v for v in candidates if v > 0]
+    effective_size = min(positive_candidates) if positive_candidates else 0.0
 
     if row is None and effective_size <= 0.0001:
         with _positions_lock:
@@ -73,7 +81,7 @@ def _reconcile_position_after_exit_attempt(token_id: str, pos: dict) -> bool:
         )
         return True
 
-    if bool(row.get("redeemable", False)):
+    if isinstance(row, dict) and bool(row.get("redeemable", False)):
         with _positions_lock:
             open_positions.pop(token_id, None)
         hold_seconds = (
@@ -105,11 +113,16 @@ def _sync_local_position_size(token_id: str, local_pos: dict, live_row: dict | N
     if live_size is None:
         live_size = 0.0
 
+    local_size = float(local_pos.get("size", 0.0) or 0.0)
     token_balance = get_conditional_token_balance(token_id)
     if token_balance < 0:
         return
 
-    synced_size = min(token_balance, live_size if live_size > 0 else token_balance)
+    candidates = [max(local_size, 0.0), max(token_balance, 0.0)]
+    if live_size > 0:
+        candidates.append(max(live_size, 0.0))
+    positive = [v for v in candidates if v > 0]
+    synced_size = min(positive) if positive else 0.0
     with _positions_lock:
         if token_id in open_positions:
             open_positions[token_id]["size"] = max(synced_size, 0.0)
@@ -131,6 +144,7 @@ def _close_position(token_id: str, reason: str = None, tp_target: float = None, 
             return
         pos = open_positions[token_id].copy()
         size, entry_price = pos["size"], pos["entry_price"]
+        entry_cost_usdc = float(pos.get("entry_cost_usdc", 0.0) or 0.0)
         pending_oid = pos.get("pending_sell_oid")
 
     if pending_oid:
@@ -161,6 +175,10 @@ def _close_position(token_id: str, reason: str = None, tp_target: float = None, 
         limit_price = _quantize_down(target_price, tick_size, tick_size)
 
         safe_size = _quantize_down(size, 0.01, 0.0)
+        if entry_cost_usdc > 0 and entry_price > 0:
+            cap_size_by_entry = _quantize_down(entry_cost_usdc / entry_price, 0.01, 0.0)
+            if cap_size_by_entry > 0:
+                safe_size = min(safe_size, cap_size_by_entry)
         if safe_size + 1e-9 < min_order_size:
             send(f"⚠️ 平倉失敗：可賣數量無效\nToken: {token_id[:12]}…\n持倉: {size:.4f}")
             live_positions = fetch_live_positions()
@@ -175,6 +193,14 @@ def _close_position(token_id: str, reason: str = None, tp_target: float = None, 
             f"bid={best_bid} ask={best_ask} tick={tick_size} min_size={min_order_size}"
         )
 
+        attempt_id = record_order_attempt(
+            scope="exit",
+            side="SELL",
+            token_id=token_id,
+            reason=reason or "",
+            limit_price=limit_price,
+            size=safe_size,
+        )
         order_args = OrderArgs(price=limit_price, size=safe_size, side=SELL, token_id=token_id)
         signed_order = _api_call_with_timeout(client.create_order, order_args)
         resp = _api_call_with_timeout(client.post_order, signed_order, OrderType.FAK)
@@ -184,6 +210,14 @@ def _close_position(token_id: str, reason: str = None, tp_target: float = None, 
         if not success:
             err = (getattr(resp, "errorMsg", "")
                    or (resp.get("errorMsg", "") if isinstance(resp, dict) else ""))
+            record_order_result(
+                attempt_id=attempt_id,
+                scope="exit",
+                success=False,
+                error_text=err,
+                token_id=token_id,
+                reason=reason or "",
+            )
             send(f"⚠️ 平倉下單失敗\n"
                  f"Token: {token_id[:12]}…\n"
                  f"持倉: {size:.2f} 份 @ {entry_price:.3f}\n"
@@ -197,6 +231,14 @@ def _close_position(token_id: str, reason: str = None, tp_target: float = None, 
             return
 
         oid = _get_order_id(resp)
+        record_order_result(
+            attempt_id=attempt_id,
+            scope="exit",
+            success=True,
+            order_id=oid,
+            token_id=token_id,
+            reason=reason or "",
+        )
         exit_price = limit_price
         size_matched = 0.0
 
@@ -305,6 +347,12 @@ def _close_position(token_id: str, reason: str = None, tp_target: float = None, 
 
     except Exception as e:
         err_str = str(e)
+        record_api_error(
+            "trade_exit_close_position",
+            e,
+            token_id=token_id,
+            reason=reason or "",
+        )
         hold_time = (datetime.datetime.now(datetime.timezone.utc)
                      - pos["opened_at"]).total_seconds()
 

@@ -17,6 +17,7 @@ from btc5m.config import (
     BOT, CHAT_ID, FUNDER_ADDRESS, POSITION_FILE, COOLDOWN_SEC,
     _send_lock, _recently_closed, _API_EXECUTOR, client,
 )
+from btc5m.observability import log_event, record_api_error, record_rpc_warning
 
 
 # ======================================================
@@ -37,11 +38,57 @@ def send(msg: str):
 
 def _api_call_with_timeout(fn, *args, timeout=10, **kwargs):
     """在共享執行緒池中以超時方式執行 API 呼叫。"""
+    started_at = time.time()
+    fn_name = getattr(fn, "__name__", str(fn))
     future = _API_EXECUTOR.submit(fn, *args, **kwargs)
     try:
-        return future.result(timeout=timeout)
-    except concurrent.futures.TimeoutError:
-        raise TimeoutError(f"API 呼叫 {fn.__name__} 逾時 ({timeout}s)")
+        result = future.result(timeout=timeout)
+        latency_ms = round((time.time() - started_at) * 1000, 2)
+        log_event(
+            "api_call",
+            api_name=fn_name,
+            latency_ms=latency_ms,
+            timeout_sec=timeout,
+            ok=True,
+        )
+        if fn_name == "post_order" and latency_ms >= 2500:
+            warning_msg = f"下單廣播延遲：post_order 耗時 {latency_ms} ms"
+            print(f"⚠️ {warning_msg}")
+            record_rpc_warning(
+                "order_broadcast_delay",
+                warning_msg,
+                source=fn_name,
+                latency_ms=latency_ms,
+            )
+        return result
+    except concurrent.futures.TimeoutError as e:
+        latency_ms = round((time.time() - started_at) * 1000, 2)
+        error_msg = f"API 呼叫 {fn_name} 逾時 ({timeout}s)"
+        record_api_error(
+            fn_name,
+            error_msg,
+            latency_ms=latency_ms,
+            timeout_sec=timeout,
+        )
+        if fn_name in {"get_balance_allowance", "get_order", "get_order_book"}:
+            warning_msg = f"獲取合約數據逾時：{fn_name}（{timeout}s）"
+            print(f"⚠️ {warning_msg}")
+            record_rpc_warning(
+                "contract_data_timeout",
+                warning_msg,
+                source=fn_name,
+                latency_ms=latency_ms,
+            )
+        raise TimeoutError(error_msg) from e
+    except Exception as e:
+        latency_ms = round((time.time() - started_at) * 1000, 2)
+        record_api_error(
+            fn_name,
+            e,
+            latency_ms=latency_ms,
+            timeout_sec=timeout,
+        )
+        raise
 
 
 def log_trade(data: dict):

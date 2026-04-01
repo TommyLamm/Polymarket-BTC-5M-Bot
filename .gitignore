@@ -9,6 +9,7 @@ __pycache__/
 # Logs and Data
 trades_log.csv
 *.log
+observation_logs/
 
 # Git/OS
 .DS_Store
