@@ -24,7 +24,9 @@ from btc5m.market import fetch_active_btc5m_markets, _resolve_token_id
 from btc5m.signals import get_btc_signals
 from btc5m.position_manager import manage_positions
 from btc5m.order_execution_utils import (
+    _normalize_order_status,
     _poll_order_matched,
+    _cancel_order_and_validate,
     _quantize_down,
     _quantize_up,
     _extract_orderbook_constraints,
@@ -43,6 +45,88 @@ from py_clob_client.order_builder.constants import BUY
 ATM_MIN_ASK = 0.30
 ATM_MAX_ASK = 0.70
 ENTRY_MIN_TIME_LEFT_SEC = 60
+
+
+def _extract_order_fill_snapshot(order_state, fallback_price: float) -> tuple[str, float, float]:
+    """從 get_order 回應提取狀態、成交價與成交量。"""
+    status_raw = (getattr(order_state, "status", "") if hasattr(order_state, "status")
+                  else order_state.get("status", "") if isinstance(order_state, dict) else "")
+    status = _normalize_order_status(status_raw)
+
+    size_matched = 0.0
+    if hasattr(order_state, "size_matched"):
+        try:
+            size_matched = float(order_state.size_matched or 0)
+        except (TypeError, ValueError):
+            size_matched = 0.0
+    elif isinstance(order_state, dict):
+        raw_size = (
+            order_state.get("size_matched")
+            or order_state.get("sizeMatched")
+            or order_state.get("filled_size")
+            or order_state.get("filledSize")
+            or order_state.get("matched_size")
+            or order_state.get("matchedSize")
+            or 0
+        )
+        try:
+            size_matched = float(raw_size or 0)
+        except (TypeError, ValueError):
+            size_matched = 0.0
+
+    avg_price = fallback_price
+    raw_price = None
+    if hasattr(order_state, "price"):
+        raw_price = order_state.price
+    elif isinstance(order_state, dict):
+        raw_price = order_state.get("price") or order_state.get("avg_price") or order_state.get("avgPrice")
+    if raw_price is not None:
+        try:
+            avg_price = float(raw_price)
+        except (TypeError, ValueError):
+            pass
+
+    return status, avg_price, size_matched
+
+
+def _confirm_entry_fill_after_timeout(
+    order_id: str,
+    fallback_price: float,
+) -> tuple[bool, float, float]:
+    """
+    超時後二次查單：
+    - 若可確認有成交（status/size_matched），回傳 (True, fill_price, size_matched)
+    - 否則回傳 (False, fallback_price, 0.0)
+    """
+    confirmed_fill = False
+    fill_price = fallback_price
+    matched_size = 0.0
+    terminal_unfilled = {"CANCELED", "REJECTED", "EXPIRED", "FAILED", "UNMATCHED"}
+    fill_status = {"MATCHED", "FILLED", "PARTIALLY_MATCHED", "PARTIALLY_FILLED"}
+
+    canceled = _cancel_order_and_validate(order_id, "進場超時")
+    if not canceled:
+        print(f"⚠️ 進場超時取消未完全確認：{order_id[:16]}…，改以查單結果判斷")
+
+    for _ in range(3):
+        try:
+            st = _api_call_with_timeout(client.get_order, order_id)
+            status, price, size = _extract_order_fill_snapshot(st, fallback_price)
+            fill_price = price if price > 0 else fill_price
+            matched_size = max(matched_size, size)
+            print(f"🔎 超時後查單: status={status} | size_matched={size}")
+            if status in fill_status and (size > 0 or status in {"MATCHED", "FILLED"}):
+                confirmed_fill = True
+                break
+            if status in terminal_unfilled:
+                break
+        except Exception as confirm_err:
+            print(f"⚠️ 超時後查單失敗: {confirm_err}")
+        time.sleep(1)
+
+    if confirmed_fill and matched_size <= 0:
+        matched_size = 0.0
+    return confirmed_fill, fill_price, matched_size
 
 
 def analyze_and_trade():
@@ -392,8 +476,10 @@ def analyze_and_trade():
 
                 filled, fill_price, size_matched = _poll_order_matched(oid, limit_price)
                 if not filled:
-                    try:
-                        _api_call_with_timeout(client.cancel, oid)
+                    confirmed_fill, fill_price, timeout_size_matched = _confirm_entry_fill_after_timeout(
+                        oid, limit_price
+                    )
+                    if not confirmed_fill:
                         send(f"⏰ 訂單 {oid[:12]}… 超時未成交，已取消")
                         record_missed_trade(
                             "order_timeout_unfilled",
@@ -402,9 +488,13 @@ def analyze_and_trade():
                             token_id=target_token_id,
                             order_id=oid,
                         )
-                    except Exception as cancel_err:
-                        print(f"⚠️ 訂單超時取消失敗: {cancel_err}")
-                    continue
+                        continue
+
+                    size_matched = timeout_size_matched
+                    send(
+                        f"⚠️ 訂單 {oid[:12]}… 輪詢超時，但查單確認已有成交，"
+                        "改為按已成交建倉"
+                    )
 
                 send("⏳ 等待鏈上結算 (10s)...")
                 time.sleep(10)

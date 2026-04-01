@@ -217,6 +217,24 @@ def cmd_status(message):
         f"💳 下單後餘額(10s): {post_bal_str}\n"
         f"{'\u2500'*28}"
     )
+    try:
+        missed_summary = summarize_missed_trades(window_sec=3600)
+        total = int(missed_summary.get("total", 0) or 0)
+        if total > 0:
+            msg += "\n\n📉 *Missed Trades（近1小時）*"
+            for item in missed_summary.get("by_reason", []):
+                if not isinstance(item, dict):
+                    continue
+                reason_label = str(item.get("reason_label") or item.get("reason_code") or "未知原因")
+                count = int(item.get("count", 0) or 0)
+                ratio = float(item.get("ratio_pct", 0.0) or 0.0)
+                msg += (
+                    f"\n過去一小時內有 `{ratio:.1f}%` 的信號因「{reason_label}」被過濾，"
+                    f"共 `{count}/{total}` 次。"
+                )
+    except Exception as e:
+        print(f"⚠️ 組裝 Missed Trades 狀態失敗: {e}")
+
     BOT.reply_to(message, msg, parse_mode="Markdown")
 
 
