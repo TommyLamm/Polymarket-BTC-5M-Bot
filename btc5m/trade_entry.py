@@ -11,6 +11,8 @@ from btc5m.config import (
     MAX_USD, SLIPPAGE, MIN_SPREAD, MAX_SPREAD,
     ENTRY_COST_TOLERANCE_USD,
     DAILY_MAX_LOSS, DAILY_TAKE_PROFIT,
+    TP_BASE_PCT, TP_TREND_PCT, TP_HIGH_VOL_PCT,
+    SL_BASE_PCT, SL_HIGH_VOL_PCT,
     POS_MAX_HOLD_SEC, MAX_POSITIONS, COOLDOWN_SEC,
     open_positions, _recently_closed,
     _positions_lock, _analyze_lock, _pause_until_lock,
@@ -302,13 +304,13 @@ def analyze_and_trade():
                     )
                     continue
 
-                tp_pct = 0.08
-                sl_pct = 0.10
+                tp_pct = float(TP_BASE_PCT)
+                sl_pct = float(SL_BASE_PCT)
                 if btc_info["adx"] > 25:
-                    tp_pct = 0.12
+                    tp_pct = max(tp_pct, float(TP_TREND_PCT))
                 if btc_info["close"] > 0 and btc_info["atr"] / btc_info["close"] > 0.0015:
-                    sl_pct = 0.15
-                    tp_pct = max(tp_pct, 0.15)
+                    sl_pct = max(sl_pct, float(SL_HIGH_VOL_PCT))
+                    tp_pct = max(tp_pct, float(TP_HIGH_VOL_PCT))
 
                 rr_ratio = tp_pct / sl_pct
                 limit_price = round(min(best_bid + spread * 0.5 * (1 + SLIPPAGE), best_ask), 3)

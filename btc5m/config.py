@@ -92,6 +92,11 @@ MIN_SPREAD        = 0.015   # 最小有效買賣價差
 MAX_SPREAD        = 0.2     # 最大容許買賣價差
 START_CAPITAL     = 75     # 初始資本基準（用於計算每日風控門檻）
 ENTRY_COST_TOLERANCE_USD = 0.02  # 成交成本超出 MAX_USD 的容忍值
+TP_BASE_PCT       = 0.12   # 基準止盈比例
+TP_TREND_PCT      = 0.15   # 趨勢明確時止盈比例
+TP_HIGH_VOL_PCT   = 0.18   # 高波動時止盈比例
+SL_BASE_PCT       = 0.10   # 基準止損比例
+SL_HIGH_VOL_PCT   = 0.15   # 高波動時止損比例
 
 # ======================================================
 # 🛡️  風控與持倉參數
@@ -103,6 +108,9 @@ CONSECUTIVE_LOSS_LIMIT = 3     # 連續虧損觸發熔斷的次數
 PAUSE_AFTER_LOSS_SEC   = 900   # 熔斷後暫停時間（15 分鐘）
 STOPLOSS_CONFIRM_COUNT = 3     # 止損連續確認次數
 STOPLOSS_EMERGENCY_EXTRA_PCT = 0.05  # 超過 SL 額外跌幅時啟用緊急止損
+ENDGAME_GRACE_SEC = 60         # 市場結束前寬限秒數（末段只保留緊急止損）
+ENDGAME_ONLY_EMERGENCY_SL = True
+ENDGAME_NOTIFY_INTERVAL_SEC = 20
 
 # ======================================================
 # 🗂️  共享狀態
@@ -136,7 +144,15 @@ POSITION_FILE = os.path.join(os.path.dirname(_SCRIPT_DIR), "trades_log.csv")
 # 共享執行緒池：避免每次 API 呼叫都建立新池
 _API_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
-# 市場資料快取（55 秒 TTL，略小於 5 分鐘窗口）
+# ======================================================
+# ⏱️  排程與快取參數（工程安全上限）
+# ======================================================
+ANALYZE_INTERVAL_SEC = 1.0
+MANAGE_INTERVAL_SEC = 0.5
+SCHEDULER_TICK_SEC = 0.1
+MARKET_CACHE_TTL_SEC = 1.0
+
+# 市場資料快取（與排程參數對齊）
 _market_cache:    list[dict] = []
 _market_cache_ts: float      = 0.0
-_MARKET_CACHE_TTL            = 55.0
+_MARKET_CACHE_TTL            = MARKET_CACHE_TTL_SEC

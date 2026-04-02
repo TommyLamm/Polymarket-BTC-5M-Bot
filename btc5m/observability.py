@@ -50,6 +50,9 @@ POSITION_EVENT_LABELS: dict[str, str] = {
     "settlement_redeemable_cleared": "對賬確認可領取，已清除本地持倉",
     "settlement_reconcile_pending": "對賬後仍有持倉，持續監控",
     "dust_recovered_tradeable": "dust 持倉恢復可交易",
+    "endgame_grace_skip_takeprofit": "末段寬限：暫不執行止盈",
+    "endgame_grace_skip_stoploss": "末段寬限：暫不執行一般止損",
+    "endgame_grace_skip_timeout": "末段寬限：暫不執行超時平倉",
 }
 
 

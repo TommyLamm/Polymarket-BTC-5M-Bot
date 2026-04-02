@@ -29,9 +29,10 @@ def fetch_active_btc5m_markets() -> list[dict]:
               從 events[] 中找 endDate 最近的活躍事件
       備援 → 時間戳推算 slug，直接查 GET /events/slug/{slug}
 
-    加入 55 秒快取，避免每 20 秒都重複請求 API。
+    加入可配置快取，避免高頻排程下重複請求 API。
     """
     now_ts = time.time()
+    _cfg._MARKET_CACHE_TTL = float(getattr(_cfg, "MARKET_CACHE_TTL_SEC", _cfg._MARKET_CACHE_TTL))
     if _cfg._market_cache and now_ts - _cfg._market_cache_ts < _cfg._MARKET_CACHE_TTL:
         return _cfg._market_cache  # 快取命中，直接回傳
 

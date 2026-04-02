@@ -8,7 +8,9 @@ import datetime
 from btc5m.config import (
     client,
     POS_MAX_HOLD_SEC,
+    TP_BASE_PCT, SL_BASE_PCT,
     STOPLOSS_CONFIRM_COUNT, STOPLOSS_EMERGENCY_EXTRA_PCT,
+    ENDGAME_GRACE_SEC, ENDGAME_ONLY_EMERGENCY_SL, ENDGAME_NOTIFY_INTERVAL_SEC,
     open_positions, _recently_closed,
     _positions_lock, _manage_lock,
 )
@@ -243,8 +245,8 @@ def manage_positions():
                     print(f"⚠️ 訂單簿為空但未超時 ({int(hold_seconds)}s) | token={token_id[:12]}…")
                 continue
 
-            tp_pct = float(pos.get("tp_pct", 0.08))
-            sl_pct = float(pos.get("sl_pct", 0.10))
+            tp_pct = float(pos.get("tp_pct", TP_BASE_PCT))
+            sl_pct = float(pos.get("sl_pct", SL_BASE_PCT))
             tp_pct = min(max(tp_pct, 0.01), 0.95)
             sl_pct = min(max(sl_pct, 0.01), 0.95)
 
@@ -262,8 +264,38 @@ def manage_positions():
             else:
                 max_hold = min(POS_MAX_HOLD_SEC, max(pos["time_left"] - 30, 30))
 
+            remaining_to_end = float(pos.get("time_left", 0.0) or 0.0) - hold_seconds
+            in_endgame = 0 <= remaining_to_end <= float(ENDGAME_GRACE_SEC)
+
             reason = None
             if best_bid >= tp_target:
+                if in_endgame and bool(ENDGAME_ONLY_EMERGENCY_SL):
+                    now_ts = time.time()
+                    with _positions_lock:
+                        cur = open_positions.get(token_id)
+                        if cur is None:
+                            continue
+                        last_notice = float(cur.get("endgame_tp_notified_at", 0.0) or 0.0)
+                        should_notice = (now_ts - last_notice) >= float(ENDGAME_NOTIFY_INTERVAL_SEC)
+                        if should_notice:
+                            cur["endgame_tp_notified_at"] = now_ts
+                    if should_notice:
+                        record_position_event(
+                            "endgame_grace_skip_takeprofit",
+                            message="endgame grace active, skipping take profit",
+                            token_id=token_id,
+                            hold_seconds=hold_seconds,
+                            time_left=remaining_to_end,
+                            best_bid=best_bid,
+                            tp_target=tp_target,
+                        )
+                        send(
+                            f"🕒 末段寬限：暫不止盈\n"
+                            f"📋 {pos['question'][:40]}\n"
+                            f"現價: {best_bid:.3f} | TP: {tp_target:.3f}\n"
+                            f"剩餘: {int(max(remaining_to_end, 0))}s"
+                        )
+                    continue
                 reason = "🎯 達到動態止盈"
             elif best_bid <= sl_target:
                 emergency_sl = sl_target * (1 - STOPLOSS_EMERGENCY_EXTRA_PCT)
@@ -273,6 +305,34 @@ def manage_positions():
                         if token_id in open_positions:
                             open_positions[token_id]["sl_confirm_count"] = 0
                 else:
+                    if in_endgame and bool(ENDGAME_ONLY_EMERGENCY_SL):
+                        now_ts = time.time()
+                        with _positions_lock:
+                            cur = open_positions.get(token_id)
+                            if cur is None:
+                                continue
+                            cur["sl_confirm_count"] = 0
+                            last_notice = float(cur.get("endgame_grace_notified_at", 0.0) or 0.0)
+                            should_notice = (now_ts - last_notice) >= float(ENDGAME_NOTIFY_INTERVAL_SEC)
+                            if should_notice:
+                                cur["endgame_grace_notified_at"] = now_ts
+                        if should_notice:
+                            record_position_event(
+                                "endgame_grace_skip_stoploss",
+                                message="endgame grace active, skipping normal stoploss",
+                                token_id=token_id,
+                                hold_seconds=hold_seconds,
+                                time_left=remaining_to_end,
+                                best_bid=best_bid,
+                                sl_target=sl_target,
+                            )
+                            send(
+                                f"🕒 末段止損寬限（僅保留緊急止損）\n"
+                                f"📋 {pos['question'][:40]}\n"
+                                f"現價: {best_bid:.3f} | SL: {sl_target:.3f}\n"
+                                f"剩餘: {int(max(remaining_to_end, 0))}s"
+                            )
+                        continue
                     with _positions_lock:
                         cur = open_positions.get(token_id)
                         if cur is None:
@@ -291,6 +351,33 @@ def manage_positions():
                             )
                         continue
             elif hold_seconds >= max_hold:
+                if in_endgame and bool(ENDGAME_ONLY_EMERGENCY_SL):
+                    now_ts = time.time()
+                    with _positions_lock:
+                        cur = open_positions.get(token_id)
+                        if cur is None:
+                            continue
+                        cur["sl_confirm_count"] = 0
+                        last_notice = float(cur.get("endgame_timeout_notified_at", 0.0) or 0.0)
+                        should_notice = (now_ts - last_notice) >= float(ENDGAME_NOTIFY_INTERVAL_SEC)
+                        if should_notice:
+                            cur["endgame_timeout_notified_at"] = now_ts
+                    if should_notice:
+                        record_position_event(
+                            "endgame_grace_skip_timeout",
+                            message="endgame grace active, skipping timeout exit",
+                            token_id=token_id,
+                            hold_seconds=hold_seconds,
+                            time_left=remaining_to_end,
+                            max_hold=max_hold,
+                        )
+                        send(
+                            f"🕒 末段寬限：暫不因超時平倉\n"
+                            f"📋 {pos['question'][:40]}\n"
+                            f"持倉: {int(hold_seconds)}s / {int(max_hold)}s\n"
+                            f"剩餘: {int(max(remaining_to_end, 0))}s"
+                        )
+                    continue
                 reason = "⏰ 結算規避/超時"
                 with _positions_lock:
                     if token_id in open_positions:

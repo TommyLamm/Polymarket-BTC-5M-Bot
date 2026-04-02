@@ -25,8 +25,11 @@ def _run_in_thread(fn):
         threading.Thread(target=fn, daemon=True).start()
     return wrapper
 
-schedule.every(20).seconds.do(_run_in_thread(analyze_and_trade))
-schedule.every(10).seconds.do(_run_in_thread(manage_positions))
+
+def _configure_schedule():
+    schedule.clear()
+    schedule.every(float(cfg.ANALYZE_INTERVAL_SEC)).seconds.do(_run_in_thread(analyze_and_trade))
+    schedule.every(float(cfg.MANAGE_INTERVAL_SEC)).seconds.do(_run_in_thread(manage_positions))
 
 
 # ======================================================
@@ -36,6 +39,8 @@ schedule.every(10).seconds.do(_run_in_thread(manage_positions))
 if __name__ == "__main__":
     _shutdown = threading.Event()
     signal.signal(signal.SIGTERM, lambda s, f: _shutdown.set())
+
+    _configure_schedule()
 
     # 啟動 Telegram Bot 監聽
     start_polling()
@@ -56,13 +61,15 @@ if __name__ == "__main__":
         f"Signature Type: {SIGNATURE_TYPE}\n"
         f"{bal_line}"
         "指標: 4H EMA(50) + 5m RSI(14) + MACD 二次確認 + Vol 放量\n"
-        "風控: ATR/ADX 自適應 TP/SL | 熔斷機制 | 每日止損/止盈"
+        "風控: ATR/ADX 自適應 TP/SL | 熔斷機制 | 每日止損/止盈\n"
+        f"排程: analyze={cfg.ANALYZE_INTERVAL_SEC}s | "
+        f"manage={cfg.MANAGE_INTERVAL_SEC}s | tick={cfg.SCHEDULER_TICK_SEC}s"
     )
 
     while not _shutdown.is_set():
         try:
             schedule.run_pending()
-            time.sleep(2)
+            time.sleep(max(0.02, float(cfg.SCHEDULER_TICK_SEC)))
         except KeyboardInterrupt:
             break
 
